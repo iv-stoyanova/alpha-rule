@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alpha-rule"
+version = "0.1.0"
+description = "AlphaZero style MCTS over Allen interval temporal rules"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "YOUR NAME", email = "you@example.com" }]   # TODO: fill in
+keywords = ["mcts", "alphazero", "allen-interval", "temporal-rules", "reinforcement-learning"]
+dependencies = ["numpy>=2.0"]
+
+[project.optional-dependencies]
+# The policy/value network and the training loop.
+nn = ["torch>=2.0"]
+# The reinforcement learning reward backend. Also needs OpenTheChests,
+# installed separately (see docs/07_rl_backend.ipynb); it is not on PyPI.
+rl = ["gymnasium>=1.0"]
+# Plots and statistics.
+analysis = ["plotly>=5.0", "scipy>=1.10", "pandas>=2.0"]
+# Everything above plus the test tooling (used by CI and for running the docs notebooks).
+dev = ["pytest>=8.0", "nbclient>=0.9", "jupyter", "alpha-rule[nn,rl,analysis]"]
+
+[tool.setuptools.packages.find]
+include = ["alpha_rule*"]
+
+[tool.pytest.ini_options]
+testpaths = ["alpha_rule/tests"]
