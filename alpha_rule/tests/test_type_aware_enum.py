@@ -14,6 +14,7 @@ Pins:
 from __future__ import annotations
 
 import itertools
+import random
 
 from alpha_rule.helpers.generic import Event
 from alpha_rule.rules.allen_matrix import AllenMatrix
@@ -23,6 +24,7 @@ from alpha_rule.rules.rule_matching import (
     generate_allen_matrix_from_history,
     generate_binary_vectors_fixed_sum,
     match_rule_to_history,
+    match_rule_to_matrix,
     matrix_left_match,
 )
 
@@ -190,3 +192,98 @@ def test_type_aware_matches_brute_force_reference():
                 f"rule={rule_str!r} hist={[(e.type, e.start, e.end) for e in history]}: "
                 f"new={new_result} ref={ref}"
             )
+
+
+# --------------------------------------------------------------------------- #
+# Fused forward-checking matcher: targeted pins + a broad brute-force fuzz.
+# --------------------------------------------------------------------------- #
+
+def test_fused_matcher_respects_relation_orientation():
+    """The relation cell is read as history[picks[s]+2, pos] (upper
+    triangle). Transposing it would read the "#" lower triangle and wrongly
+    accept. Same types, opposite temporal order -> opposite result."""
+    rule = AllenMatrix.from_hierarchy_string("A B <")  # newest A, earlier B, B before A
+    assert match_rule_to_history(rule, [Event("B", 0, 1), Event("A", 5, 6)]) is True
+    # Earlier B now comes AFTER A: the relation is ">", not "<".
+    assert match_rule_to_history(rule, [Event("B", 5, 6), Event("A", 0, 1)]) is False
+
+
+def test_fused_matcher_wildcard_type_matches_any():
+    """A "#" in the rule's type row matches any history type at that
+    position, end-to-end through the fused consumer (the enumerate tests
+    only cover the enumerator)."""
+    rule = AllenMatrix.from_hierarchy_string("A # <")  # newest A, earlier ANY, before A
+    assert match_rule_to_history(rule, [Event("C", 0, 1), Event("A", 5, 6)]) is True
+    assert match_rule_to_history(rule, [Event("B", 0, 1), Event("A", 5, 6)]) is True
+    # The relation is still enforced even with a wildcard type.
+    assert match_rule_to_history(rule, [Event("C", 5, 6), Event("A", 0, 1)]) is False
+
+
+def test_fused_matcher_indicator_row_is_load_bearing():
+    """The indicator row participates in the match. Position 0 (newest) is
+    always picked, so corrupting the rule's column-0 indicator must flip a
+    matching case to a non-match -- proving the check was not dropped."""
+    history = [Event("A", 0, 1), Event("B", 2, 5), Event("A", 6, 7)]
+    hm = generate_allen_matrix_from_history(history)
+    rule = apply_binary_vector(hm, [1, 1, 1])  # the whole history as a rule
+    assert match_rule_to_matrix(rule, hm.matrix) is True
+
+    corrupted = AllenMatrix(rule.matrix.copy(), validate=False)
+    corrupted.matrix[0, 0] = 1 - int(corrupted.matrix[0, 0])
+    assert match_rule_to_matrix(corrupted, hm.matrix) is False
+
+
+def test_fused_matcher_matches_brute_force_over_random_patterns():
+    """Broad equivalence: random histories with extracted (sliced-indicator)
+    rules, compared against the brute-force enumerate-all + matrix_left_match
+    reference. Exercises types, Allen relations and the indicator row far
+    beyond the canonical cases above."""
+    rng = random.Random(7)
+    types = ["A", "B", "C", "D"]
+
+    def rand_hist(num):
+        h, t = [], 0
+        for _ in range(num):
+            d = rng.randint(1, 6)
+            s = t
+            e = s + d
+            h.append(Event(rng.choice(types), s, e))
+            t = e + rng.randint(-d + 1, 2)
+        return h
+
+    def brute_ref(rule, history):
+        n = rule.shape[1]
+        if not history or history[-1].type != rule.matrix[1, 0]:
+            return False
+        if n == 1:
+            return True
+        allowed = set(rule.matrix[1])
+        filt = [e for e in history if "#" in allowed or e.type in allowed]
+        if len(filt) < n:
+            return False
+        m = generate_allen_matrix_from_history(filt)
+        for combo in itertools.combinations(range(1, len(filt)), n - 1):
+            vec = [0] * len(filt)
+            vec[0] = 1
+            for p in combo:
+                vec[p] = 1
+            if matrix_left_match(apply_binary_vector(m, vec), rule):
+                return True
+        return False
+
+    for _ in range(600):
+        src = rand_hist(rng.randint(2, 8))
+        m = generate_allen_matrix_from_history(src)
+        k = rng.randint(1, min(4, len(src)))
+        idx = sorted(rng.sample(range(1, len(src)), k - 1)) if k > 1 else []
+        vec = [1] + [1 if i in idx else 0 for i in range(len(src) - 1)]
+        rule = apply_binary_vector(m, vec)
+        hist = rand_hist(rng.randint(1, 9))
+        got = match_rule_to_history(rule, hist)
+        exp = brute_ref(rule, hist)
+        assert got is exp, (
+            rule.get_hierarchy_string(),
+            [(e.type, e.start, e.end) for e in hist],
+            got,
+            exp,
+        )

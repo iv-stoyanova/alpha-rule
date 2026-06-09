@@ -43,8 +43,11 @@ class AllenMatrix:
         :param hierarchy_string: A string describing the hierarchy.
         :return: An instance of AllenMatrix.
         """
+        # ``hierarchy_string_to_matrix`` is the validating owner -- it already
+        # runs ``validate_standard_matrix`` before returning, so skip the
+        # redundant re-scan in ``__init__``.
         matrix = hierarchy_string_to_matrix(hierarchy_string)
-        return cls(matrix)
+        return cls(matrix, validate=False)
 
     def get_hierarchy_string(self):
         """Returns a hierarchical string representation of the matrix."""

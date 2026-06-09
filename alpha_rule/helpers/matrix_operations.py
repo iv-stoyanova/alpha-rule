@@ -26,6 +26,11 @@ class AllenRelation(Enum):
 
 allen_relations = AllenRelation.all_relations()
 
+# Every legal relation-matrix cell value: the 13 Allen symbols plus the "#"
+# filler/wildcard. Built once at import rather than rebuilt on every
+# ``validate_standard_matrix`` call.
+VALID_RELATIONS = set(allen_relations) | {"#"}
+
 
 def validate_standard_matrix(matrix):
     """
@@ -52,15 +57,13 @@ def validate_standard_matrix(matrix):
             f"Incorrect indicator row: expected {expected_indicator.tolist()}, got {actual_indicator.tolist()}")
 
 
-    # Validate relation matrix
-    valid_relations = set(AllenRelation.all_relations()).union({"#"})
-
+    # Validate relation matrix (VALID_RELATIONS is built once at import)
     for i in range(2, rows):
         for j in range(cols):
             value = matrix[i, j]
 
             # Check if value is a valid Allen relation or "#"
-            if value not in valid_relations:
+            if value not in VALID_RELATIONS:
                 raise ValueError(f"Invalid relation at ({i}, {j}): '{value}'")
 
             # Check diagonal elements are "="

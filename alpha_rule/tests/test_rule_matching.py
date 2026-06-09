@@ -11,10 +11,15 @@ Pins:
 """
 from __future__ import annotations
 
+import random
+
+import numpy as np
+
 from alpha_rule.helpers.generic import Event
 from alpha_rule.rules.allen_matrix import AllenMatrix
 from alpha_rule.rules.rule_matching import (
     determine_allen_relation,
+    generate_allen_matrix_from_history,
     generate_binary_vectors_fixed_sum,
     match_rule_to_history,
 )
@@ -147,3 +152,54 @@ def test_match_two_event_rule_last_event_type_mismatch():
     history = [Event("A", 0, 1), Event("A", 5, 6)]
     # Last event isn't type B, so the short-circuit returns False.
     assert match_rule_to_history(rule, history) is False
+
+
+# --------------------------------------------------------------------------- #
+# generate_allen_matrix_from_history: the vectorised builder must reproduce
+# the scalar determine_allen_relation double-loop exactly.
+# --------------------------------------------------------------------------- #
+
+def _scalar_rel_rows(history):
+    """Reference: the original scalar build of rows[1:] (types + relations)."""
+    n = len(history)
+    rows = np.full((n + 1, n), "#", dtype=object)  # row 0 = types, rows 1.. = relations
+    rows[0] = [e.type for e in reversed(history)]
+    for i in range(n):
+        rows[i + 1, i] = "="
+    for i in range(n):
+        for j in range(i + 1, n):
+            rel = determine_allen_relation(history[n - 1 - j], history[n - 1 - i])
+            if rel:
+                rows[i + 1, j] = rel
+    return rows
+
+
+def test_builder_matrix_is_object_dtype():
+    m = generate_allen_matrix_from_history([Event("A", 0, 1), Event("B", 2, 3)])
+    assert m.matrix.dtype == object
+
+
+def test_builder_zero_length_coincident_is_meets_not_equals():
+    # determine_allen_relation checks "m" (end == start) BEFORE "=" (equal
+    # spans), so two coincident zero-length intervals classify as "m". The
+    # vectorised np.select must preserve that ordering.
+    m = generate_allen_matrix_from_history([Event("A", 0, 0), Event("B", 0, 0)])
+    # cell [2, 1] is the relation between the two events.
+    assert m.matrix[2, 1] == "m"
+
+
+def test_builder_matches_scalar_reference_over_random_histories():
+    rng = random.Random(2024)
+    types = ["A", "B", "C", "D"]
+    for _ in range(300):
+        n = rng.randint(1, 10)
+        history, t = [], 0
+        for _ in range(n):
+            d = rng.randint(0, 6)          # 0 exercises zero-length intervals
+            s = t
+            e = s + d
+            history.append(Event(rng.choice(types), s, e))
+            t = e + rng.randint(-d, 2)     # overlaps / negative gaps too
+        built = generate_allen_matrix_from_history(history).matrix
+        ref = _scalar_rel_rows(history)
+        assert np.array_equal(built[1:].astype(str), ref.astype(str)), history

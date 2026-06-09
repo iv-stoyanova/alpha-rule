@@ -97,15 +97,91 @@ def enumerate_type_matched_vectors(history_types, rule_types):
 
 
 def _match_via_type_aware_enum(filtered_am, rule_matrix):
-    """Type-aware enumeration + ``matrix_left_match``. Shared inner loop
-    used by both ``match_rule_to_history`` and ``match_rule_to_matrix``."""
-    history_types = list(filtered_am.matrix[1])
-    rule_types = list(rule_matrix.matrix[1])
-    for binary_vector in enumerate_type_matched_vectors(history_types, rule_types):
-        candidate_matrix = apply_binary_vector(filtered_am, binary_vector)
-        if matrix_left_match(candidate_matrix, rule_matrix):
-            return True
-    return False
+    """Forward-checking DFS. Shared inner loop used by both
+    ``match_rule_to_history`` and ``match_rule_to_matrix``.
+
+    Searches for an assignment of history positions to rule indices
+    ``0..k-1`` (position 0, the newest event, is always picked) that is
+    consistent in event type, indicator row, and pairwise Allen relations,
+    abandoning a partial assignment the moment a picked position violates a
+    constraint.
+
+    This is the fused, early-pruning equivalent of the
+    ``enumerate_type_matched_vectors`` + ``apply_binary_vector`` +
+    ``matrix_left_match`` pipeline (kept intact below as the tested
+    reference). That pipeline materialised a submatrix per candidate and
+    re-scanned every cell at the leaf; here each constraint is checked as a
+    position is picked, so candidates that already break an Allen relation
+    are pruned instead of completed and rejected -- turning the worst case
+    from seconds into well under a millisecond.
+
+    Equivalence to ``matrix_left_match``: a candidate is rejected iff some
+    rule cell is not ``"#"`` and differs from the candidate cell. With
+    ascending picks, ``apply_binary_vector`` slices rows
+    ``[0, 1] + [i+2 for i in picks]`` and columns ``picks``, so candidate
+    cell ``(0, b) = H[0, picks[b]]``, ``(1, b) = H[1, picks[b]]`` and
+    ``(s+2, c) = H[picks[s]+2, picks[c]]``. The diagonal (``"="``) and the
+    lower triangle (``"#"``) are structurally invariant after an ascending
+    slice and can never reject, so only the indicator row, the type row and
+    the strict upper triangle of relations matter -- exactly the three
+    checks below. The indicator row is load-bearing: ``rule.matrix[0, j]``
+    is an ``int`` (never ``"#"``), so ``matrix_left_match`` always forces an
+    exact match there; the candidate's row 0 is *sliced* from the parent,
+    not recomputed, so the check is column-local and folds into the walk.
+    """
+    # ``.tolist()`` once turns the object matrices into nested Python lists
+    # so the hot inner loop uses plain list indexing rather than per-cell
+    # numpy scalar access (O(n^2) one-off, negligible beside the search).
+    hl = filtered_am.matrix.tolist()
+    rl = rule_matrix.matrix.tolist()
+    n = filtered_am.shape[1]
+    k = rule_matrix.shape[1]
+    if k < 1 or n < k:
+        return False
+
+    h_ind, h_types = hl[0], hl[1]
+    r_ind, r_types = rl[0], rl[1]
+
+    # Position 0 (newest) is always picked; its type and indicator must
+    # match the rule's first column or no candidate can match.
+    if not (r_types[0] == "#" or h_types[0] == r_types[0]):
+        return False
+    if r_ind[0] != h_ind[0]:
+        return False
+    if k == 1:
+        return True
+
+    picks = [0] * k
+
+    def walk(depth, last_pos):
+        target = r_types[depth]
+        ind = r_ind[depth]
+        last = depth == k - 1
+        for pos in range(last_pos + 1, n):
+            # type
+            if not (target == "#" or h_types[pos] == target):
+                continue
+            # indicator (column-local: candidate row 0 is sliced, not recomputed)
+            if ind != h_ind[pos]:
+                continue
+            # Allen relations against every earlier pick (strict upper triangle;
+            # picks are strictly ascending so picks[s] < pos for s < depth)
+            ok = True
+            for s in range(depth):
+                rel = rl[s + 2][depth]
+                if rel != "#" and rel != hl[picks[s] + 2][pos]:
+                    ok = False
+                    break
+            if not ok:
+                continue
+            picks[depth] = pos
+            if last:
+                return True
+            if walk(depth + 1, pos):
+                return True
+        return False
+
+    return walk(1, 0)
 
 
 def filter_event_type(event, etype):
@@ -259,24 +335,54 @@ def generate_allen_matrix_from_history(history):
     # Initialize matrix with "#"
     matrix = np.full((matrix_size, n), "#", dtype=object)
 
-    # Step 1: Assign the event types (history is reversed)
+    # Step 1: Assign the event types (history is reversed -> column 0 newest)
     matrix[1] = [event.type for event in reversed(history)]
 
-    # Step 2: Fill the diagonal with "="
-    for i in range(n):
-        matrix[i + 2, i] = "="  # Self-equality
+    # Step 2 & 3: Allen relations, vectorised. The scalar form fills
+    # cell [i+2, j] (i < j) with determine_allen_relation(rev[j], rev[i])
+    # where rev = history reversed (rev[0] = newest). We compute all pairs
+    # at once with broadcasting and pick the relation with np.select, whose
+    # first-true semantics mirror determine_allen_relation's short-circuit
+    # if-chain -- so the *order* of conditions below must match that
+    # function exactly (e.g. "m" before "=", so coincident zero-length
+    # intervals classify as "m", just like the scalar path).
+    start = np.asarray([event.start for event in reversed(history)])
+    end = np.asarray([event.end for event in reversed(history)])
+    # event1 = rev[j] (column), event2 = rev[i] (row)
+    a_s, a_e = start[None, :], end[None, :]   # column-indexed (event1)
+    b_s, b_e = start[:, None], end[:, None]   # row-indexed (event2)
+    conditions = [
+        a_e < b_s,                                          # "<"  before
+        a_e == b_s,                                         # "m"  meets
+        (a_s < b_s) & (b_s < a_e) & (a_e < b_e),            # "o"  overlaps
+        (a_s == b_s) & (a_e < b_e),                         # "s"  starts
+        (a_s > b_s) & (a_e < b_e),                          # "d"  during
+        (a_s > b_s) & (a_e == b_e),                         # "f"  finishes
+        (a_s == b_s) & (a_e == b_e),                        # "="  equals
+        a_s > b_e,                                          # ">"  after
+        a_s == b_e,                                         # "mi" met by
+        (b_s < a_s) & (a_s < b_e) & (b_e < a_e),            # "oi" overlapped by
+        (a_s == b_s) & (a_e > b_e),                         # "si" started by
+        (a_s < b_s) & (a_e > b_e),                          # "di" contains
+        (a_s < b_s) & (a_e == b_e),                         # "fi" finished by
+    ]
+    choices = ["<", "m", "o", "s", "d", "f", "=", ">", "mi", "oi", "si", "di", "fi"]
+    relations = np.select(conditions, choices, default="#")  # (n, n)
 
-    # Step 3: Compute Allen relations
-    for i in range(n):
-        for j in range(i + 1, n):  # Only fill upper triangle
-            relation = determine_allen_relation(history[n - 1 - j], history[n - 1 - i])  # Reverse indexing
-            if relation:
-                matrix[i + 2, j] = relation  # Assign relation
+    # Keep only the strict upper triangle (i < j); diagonal is "=" and the
+    # lower triangle stays "#", exactly as the scalar loop leaves them.
+    block = np.full((n, n), "#", dtype=object)
+    upper = np.triu_indices(n, k=1)
+    block[upper] = relations[upper]
+    np.fill_diagonal(block, "=")
+    matrix[2:] = block
 
     # Step 4: Compute indicator row dynamically
     matrix[0] = check_rows_columns_combined(matrix[1:]).astype(int)
 
-    return AllenMatrix(matrix)
+    # The matrix is valid by construction; skip the O(n^2) re-scan that
+    # AllenMatrix would otherwise run on every match call.
+    return AllenMatrix(matrix, validate=False)
 
 
 def determine_allen_relation(event1, event2):
