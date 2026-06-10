@@ -94,6 +94,40 @@ def test_apply_end_rule_marks_child_terminal_with_no_productions():
     assert g.applicable_productions(terminal) == []           # nothing follows END
 
 
+def test_n_possible_actions_matches_applicable_productions_for_each_node_kind():
+    """
+    The grammar stamps ``n_possible_actions`` on every node it builds. It is
+    computed arithmetically in ``AllenIntervalGrammar._child`` for speed, so
+    pin it against the real ``applicable_productions`` length for each kind of
+    node: the root (event step, no END_RULE), an event-step child and a
+    relation-step child (both offer END_RULE), and a terminal (offers nothing).
+    If the arithmetic ever drifts from ``applicable_productions``,
+    ``is_fully_expanded`` and the dead-cascade break silently.
+    """
+    g = AllenIntervalGrammar(event_types=("A", "B"), relations=("<", ">"))
+
+    root = g.root()                                  # level 0: event step, no END_RULE
+    after_one_event = g.apply(                       # level 1: event step, END_RULE offered
+        root, next(p for p in g.applicable_productions(root) if p.name == "A")
+    )
+    after_two_events = g.apply(                      # level 2: relation step, END_RULE offered
+        after_one_event,
+        next(p for p in g.applicable_productions(after_one_event) if p.name == "B"),
+    )
+    terminal = g.apply(                              # terminal: nothing follows
+        after_one_event,
+        next(p for p in g.applicable_productions(after_one_event) if p.name == "END_RULE"),
+    )
+
+    for node in (root, after_one_event, after_two_events, terminal):
+        assert node.n_possible_actions == len(g.applicable_productions(node)), node.name
+
+    # Guard that the three kinds really were exercised.
+    assert should_add_event(root.level) and should_add_event(after_one_event.level)
+    assert not should_add_event(after_two_events.level)
+    assert terminal.is_terminal and g.applicable_productions(terminal) == []
+
+
 # --------------------------------------------------------------------------- #
 # Swap test: a different Grammar drives run_self_play unchanged.
 # --------------------------------------------------------------------------- #
