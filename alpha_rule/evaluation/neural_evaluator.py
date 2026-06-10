@@ -20,6 +20,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import torch
+import torch.nn.functional as F
+
 from alpha_rule.evaluation.evaluator import EvalResult, Evaluator
 from alpha_rule.grammar.grammar import Grammar
 
@@ -66,10 +69,28 @@ class NeuralEvaluator(Evaluator):
         self.max_len = max_len
         self.value_scale = float(value_scale)
 
-    def evaluate(self, node) -> EvalResult:
-        import torch                                # lazy
-        import torch.nn.functional as F             # lazy
+    @classmethod
+    def from_simulator(
+        cls,
+        model: "AllenFormulaNet",
+        grammar: Grammar,
+        simulator,
+        *,
+        max_len: int,
+    ) -> "NeuralEvaluator":
+        """Build an evaluator whose ``value_scale`` matches the simulator's
+        ``reward_scale`` (the same cap ``run_self_play`` / ``ReplayBuffer`` use),
+        so the network value is returned in raw-reward units consistent with the
+        simulator's rewards in the shared MCTS backup. Prefer this over the bare
+        constructor when wiring the net into search: the constructor defaults
+        ``value_scale=1.0``, which silently mismatches a simulator whose
+        ``reward_scale`` is not 1. Falls back to ``1.0`` if the simulator
+        exposes no ``reward_scale``.
+        """
+        scale = getattr(simulator, "reward_scale", None) or DEFAULT_VALUE_SCALE
+        return cls(model, grammar, max_len=max_len, value_scale=scale)
 
+    def evaluate(self, node) -> EvalResult:
         ids = self.model.tokenizer.encode(node.name, max_len=self.max_len).unsqueeze(0)
         ids = ids.to(next(self.model.parameters()).device)
         # predict() runs in eval + inference_mode and restores the model's prior

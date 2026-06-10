@@ -139,3 +139,61 @@ def test_value_scale_rejects_nonpositive():
         NeuralEvaluator(model, g, max_len=12, value_scale=0.0)
     with pytest.raises(ValueError):
         NeuralEvaluator(model, g, max_len=12, value_scale=-2.5)
+
+
+# --------------------------------------------------------------------------- #
+# from_simulator: wire value_scale to the simulator's reward_scale so the NN
+# value and the simulator reward share one scale in the MCTS backup.
+# --------------------------------------------------------------------------- #
+
+def test_from_simulator_matches_reward_scale():
+    g = AllenIntervalGrammar(event_types=("A", "B"), relations=("<",))
+    tok = GrammarTokenizer(g)
+    model = AllenFormulaNet(tok, d_model=16, nhead=2, num_layers=1, max_len=12)
+
+    class _Sim:
+        reward_scale = 4.0
+        def evaluate(self, node):
+            return 2.0
+
+    ev = NeuralEvaluator.from_simulator(model, g, _Sim(), max_len=12)
+    assert ev.value_scale == 4.0
+
+    class _PlainSim:                                  # no reward_scale -> 1.0
+        def evaluate(self, node):
+            return 1.0
+
+    assert NeuralEvaluator.from_simulator(model, g, _PlainSim(), max_len=12).value_scale == 1.0
+
+
+def test_neural_evaluator_drives_self_play_end_to_end():
+    """The NN evaluator plugs into run_self_play (leaf_eval_mode='nn'); with
+    from_simulator wiring the scale, the stored value targets stay in [-1, 1]."""
+    import numpy as np
+
+    from alpha_rule.mcts.replay import ReplayBuffer
+    from alpha_rule.mcts.self_play import run_self_play
+
+    torch.manual_seed(3)
+    g = AllenIntervalGrammar(event_types=("A", "B"), relations=("<",))
+    tok = GrammarTokenizer(g)
+    model = AllenFormulaNet(tok, d_model=16, nhead=2, num_layers=1, max_len=32)
+
+    class _Sim:
+        reward_scale = 4.0
+        def evaluate(self, node):
+            return 2.0
+
+    sim = _Sim()
+    ev = NeuralEvaluator.from_simulator(model, g, sim, max_len=32)
+    traj = run_self_play(
+        grammar=g, simulator=sim, network_evaluator=ev,
+        n_simulations=8, depth_limit=3, leaf_eval_mode="nn",
+        rng=np.random.default_rng(0),
+    )
+    assert len(traj.steps) >= 1
+    assert traj.value_scale == 4.0
+    buf = ReplayBuffer(capacity=20)
+    buf.push_trajectory(traj)
+    for row in buf._buf:
+        assert -1.0 <= row[2] <= 1.0
