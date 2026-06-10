@@ -1,13 +1,12 @@
 """
-MCTSRuleNode: the state object at every position in the search tree.
+MCTSRuleNode: one position in the search tree.
 
-The node is deliberately grammar-agnostic: it holds no Allen-interval logic
-and no search behaviour. It is pure state. The grammar builds and links
-nodes; selection, expansion, and backprop read and update the statistics.
-Swapping the grammar or a search strategy never touches this class.
+A node is pure state -- tree links, MCTS statistics, and a couple of flags. It
+holds no grammar or search logic: the grammar builds and links nodes, and the
+selection/expansion/backprop strategies update the statistics. Swapping the
+grammar or a strategy therefore never touches this class.
 
-See the class docstring for what each field holds and which part of the
-search uses it.
+The class docstring lists each field and where it is used.
 """
 from __future__ import annotations
 
@@ -46,14 +45,25 @@ class MCTSRuleNode:
 
     MCTS statistics:
         N:             visit count.
-        Q:             running value estimate used by selection.
-        Q_max:         best value seen in this subtree (MaxRewardBackup).
+        Q:             running aggregate maintained by the backup (a running
+                       max under ``MaxRewardBackup``, a running sum under
+                       ``PercentileRewardBackup``). NOT read by selection or by
+                       the value target -- those use ``Q_max`` /
+                       ``Q_sum``/``N_passers``. Kept as a diagnostic.
+        Q_max:         best value seen in this subtree; read by
+                       ``PUCTSelection(q_source="max")`` and ``MaxValue``.
         Q_sum, N_passers:
                        sum and count of the values that counted under the
                        active backup strategy. Their ratio is the filtered mean
-                       read by ``PUCTSelection(q_source="filtered_mean")``.
+                       read by ``PUCTSelection(q_source="filtered_mean")`` and
+                       the ``ExpectedValue`` / ``MeanPercentileValue`` targets.
         past_rewards:  per-node history of values, which
                        ``PercentileRewardBackup`` thresholds on.
+        realized_reward:
+                       the simulator's evaluation of this state's rule, stamped
+                       by ``run_self_play`` when the node is the chosen step.
+                       Read by the ``RealizedReturn`` value target. ``None``
+                       until evaluated (e.g. the episode root never is).
 
     AlphaZero prior:
         prior:         P(s, a) for this child under its parent, written by
@@ -69,6 +79,7 @@ class MCTSRuleNode:
         "name", "level", "parent", "parent_action", "children", "rule",
         "is_terminal", "is_dead", "n_possible_actions",
         "N", "Q", "Q_max", "Q_sum", "N_passers", "past_rewards", "prior",
+        "realized_reward",
     )
 
     def __init__(
@@ -110,6 +121,11 @@ class MCTSRuleNode:
 
         # AlphaZero prior P(s, a) for this child under its parent.
         self.prior: float = 1.0
+
+        # Ground-truth simulator reward of this state's rule, stamped by
+        # ``run_self_play`` when this node is the chosen step. Read by the
+        # ``RealizedReturn`` value target. ``None`` until evaluated.
+        self.realized_reward: Optional[float] = None
 
     def is_fully_expanded(self) -> bool:
         """True once every production the grammar allows here has a child."""

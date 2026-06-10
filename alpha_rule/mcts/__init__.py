@@ -16,26 +16,38 @@ from alpha_rule.mcts.backprop import (  # noqa: F401
 from alpha_rule.mcts.expansion import ExpansionStrategy, RuleExpansion  # noqa: F401
 from alpha_rule.mcts.node import MCTSRuleNode  # noqa: F401
 from alpha_rule.mcts.replay import (  # noqa: F401
-    DEFAULT_REWARD_FLOOR,
     ReplayBuffer,
     Trajectory,
     TrajectoryStep,
 )
 from alpha_rule.mcts.selection import PUCTSelection, SelectionStrategy  # noqa: F401
 from alpha_rule.mcts.self_play import run_self_play  # noqa: F401
+from alpha_rule.mcts.value_target import (  # noqa: F401
+    ExpectedValue,
+    MaxValue,
+    MeanPercentileValue,
+    RealizedReturn,
+    ValueTarget,
+    default_value_target,
+)
 
 __all__ = [
     "BackpropStrategy",
-    "DEFAULT_REWARD_FLOOR",
     "ExpansionStrategy",
+    "ExpectedValue",
     "MCTSRuleNode",
     "MaxRewardBackup",
+    "MaxValue",
+    "MeanPercentileValue",
     "PUCTSelection",
     "PercentileRewardBackup",
+    "RealizedReturn",
     "ReplayBuffer",
     "RuleExpansion",
     "SelectionStrategy",
     "Trajectory",
     "TrajectoryStep",
+    "ValueTarget",
+    "default_value_target",
     "run_self_play",
 ]

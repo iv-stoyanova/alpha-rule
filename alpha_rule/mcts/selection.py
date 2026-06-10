@@ -1,13 +1,10 @@
 """
 Selection strategy seam.
 
-A ``SelectionStrategy`` picks the next child to descend into during MCTS.
-The AlphaZero loop uses ``PUCTSelection``, which scores each child with
-the PUCT rule using its ``.prior`` (populated by ``NeuralEvaluator``).
-
-The protocol is kept tiny on purpose: ``select(parent) -> Optional[node]``
-plus an auxiliary ``score(parent, child) -> float`` for diagnostics and
-the search-tree visualisation.
+A ``SelectionStrategy`` picks the next child to descend into during a
+simulation. ``PUCTSelection`` is the default. The protocol is two methods:
+``select(parent)`` returns the chosen child (or None), and
+``score(parent, child)`` exposes the per-child score for diagnostics.
 """
 from __future__ import annotations
 
@@ -26,35 +23,23 @@ class SelectionStrategy(Protocol):
 
 class PUCTSelection(SelectionStrategy):
     """
-    AlphaZero-style PUCT with KataGo-style FPU.
+    PUCT selection with first-play urgency for unvisited children.
 
-    Score per child:
+    Each child scores ``Q + c_puct * prior * sqrt(sum_N) / (1 + N)``:
 
-        Q(s, a) + c_puct * P(s, a) * sqrt(sum_N(s)) / (1 + N(s, a))
+        Q       ``child.Q_max`` (or the filtered mean under
+                ``q_source="filtered_mean"``) for a visited child. For an
+                unvisited child, a first-play-urgency (FPU) estimate
+                ``parent_Q - fpu_reduction * sqrt(visited_prior_mass)``, where
+                ``visited_prior_mass`` is the prior mass already explored under
+                the parent. (Plain FPU = 0 makes an unvisited child look worse
+                than any visited one when rewards are positive, turning the
+                search depth-first; this reduction is the KataGo fix.)
+        prior   ``child.prior``, set by the network (1.0 until then).
+        sum_N   total visits across the siblings, floored at 1.
 
-    where:
-
-        Q(s, a) = ``child.Q_max`` for visited children. For *unvisited*
-                  children we use a "first-play urgency" estimate:
-
-                      FPU = parent_Q - fpu_reduction * sqrt(visited_policy_mass)
-
-                  where ``parent_Q`` is the parent's own Q_max (or 0 if
-                  the parent has no statistic yet) and
-                  ``visited_policy_mass`` is the sum of priors over
-                  already-visited siblings. KataGo (Wu 2019) introduced
-                  this in place of AlphaGo-Zero's FPU = 0 because, in
-                  positive-reward domains, FPU = 0 makes unvisited
-                  children look strictly worse than any visited sibling
-                  and PUCT degenerates into a depth-first sweep.
-        P(s, a) = ``child.prior``, populated by ``NeuralEvaluator``
-                  through the search loop.
-        sum_N(s) = total visits across siblings (using max(1, …) so the
-                   first call doesn't square-root zero).
-
-    Plug-compatible with ``SelectionStrategy``; the self-play loop calls
-    ``selection.select(parent)``, so a different strategy drops in without
-    touching the search.
+    ``q_source`` ("max" or "filtered_mean") selects which Q the score reads,
+    so it can match the backup in use.
     """
 
     def __init__(
@@ -77,13 +62,13 @@ class PUCTSelection(SelectionStrategy):
         self.q_source = q_source
 
     def _extract_q(self, node) -> Optional[float]:
-        """Return the node's Q-estimate under the configured ``q_source``,
-        or ``None`` when no usable statistic exists yet.
+        """Return the node's Q under the configured ``q_source``, or ``None``
+        when it has no value yet.
 
-        ``"max"`` reads ``node.Q_max`` (default; matches
-        ``MaxRewardBackup``). ``"filtered_mean"`` reads
-        ``node.Q_sum / node.N_passers`` (matches ``PercentileRewardBackup``, which uses the proper percentile-filtered mean instead of ``Q_max``,
-        which would otherwise ignore the threshold entirely)."""
+        ``"max"`` reads ``node.Q_max`` (matches ``MaxRewardBackup``);
+        ``"filtered_mean"`` reads ``node.Q_sum / node.N_passers`` (matches
+        ``PercentileRewardBackup``). ``None`` means unvisited, or that no
+        sample has passed the percentile threshold."""
         if self.q_source == "max":
             return node.Q_max if node.Q_max != float("-inf") else None
         # q_source == "filtered_mean"

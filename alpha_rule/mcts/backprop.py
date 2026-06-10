@@ -1,24 +1,21 @@
 """
-Backpropagation strategy seam.
+Backprop strategy seam.
 
-A ``BackpropStrategy`` walks from the simulated leaf up toward the root,
-updating statistics on every node it touches.
+A ``BackpropStrategy`` walks from the simulated leaf up to the root, updating
+each node's statistics on the way. Two implementations:
 
-Two implementations:
+    MaxRewardBackup (the default)
+        Keeps a running max (``Q_max``). Suited to the spiky reward here --
+        almost every rule is junk, a few are good -- so it tracks "is a good
+        rule reachable down this branch?" rather than the branch's average.
 
-    - ``MaxRewardBackup`` (the self-play default): AlphaZero-style maximum
-      backup. Walks the chain setting ``Q = max(Q, value)`` and
-      ``Q_max = max(Q_max, value)``; every finite value also feeds the
-      ``Q_sum`` / ``N_passers`` filtered mean. Best for the spiky symbolic
-      reward landscape, it answers "does a high-reward formula exist down
-      this branch?".
+    PercentileRewardBackup
+        Averages only the values above a per-node percentile threshold, so one
+        lucky rollout can't peg the score. Use it for a noisy simulator, with
+        ``PUCTSelection(q_source="filtered_mean")``.
 
-    - ``PercentileRewardBackup``: percentile-filtered sum-then-mean backup
-      for noisy simulators where a single lucky rollout would otherwise peg
-      ``Q_max``. Pair with ``PUCTSelection(q_source="filtered_mean")``.
-
-Both mark a ``-inf`` leaf dead and run the same dead-ancestor cascade:
-a parent dies once it is fully expanded and all its children are dead.
+Both mark a ``-inf`` leaf dead and run the same cascade: a node dies once it
+is fully expanded and all its children are dead.
 """
 from __future__ import annotations
 
@@ -36,40 +33,28 @@ class BackpropStrategy(Protocol):
 
 class MaxRewardBackup(BackpropStrategy):
     """
-    AlphaZero-style maximum backpropagation.
+    Maximum backup: keep the best value seen, not the average.
 
-    Walk from leaf to root setting ``Q = max(Q, value)`` and ``Q_max``
-    likewise. Every visited ancestor's ``N`` increments by 1 (so
-    PUCT's exploration term still has visit counts to work with).
+    Walking leaf to root, each node's ``N`` increments and ``Q_max`` takes the
+    running max (the diagnostic ``Q`` does too); every finite value also feeds
+    the ``Q_sum`` / ``N_passers`` mean. Low-but-finite values still count, they
+    just can't lower ``Q_max``. A ``-inf`` value marks the leaf dead.
 
-    No percentile filter, no orphan-drop: low-but-finite rewards still
-    update the chain, they just can't lower ``Q``.
-
-    ``-inf`` rewards mark the leaf dead and trigger the
-    "all siblings dead then parent dead" cascade shared with
-    ``PercentileRewardBackup``.
-
-    Why this matters for symbolic search: the reward landscape over
-    formulas is spiky, almost everything is junk, only a handful of
-    derivations are good. A mean backup drowns the rare successes in
-    surrounding garbage; max-backup answers "does a high-reward formula
-    exist down this branch?", which is exactly what MCTS should optimise
-    for here.
+    A mean backup would drown the rare good rule in the surrounding junk; the
+    max keeps it visible, so selection chases branches that can reach a good
+    rule rather than branches that are merely good on average.
     """
 
     def update(self, leaf, value: float) -> None:
-        # Mark ONLY the leaf dead on -inf, not every ancestor. Killing
-        # the whole root-to-leaf path on a single bad simulation would make
-        # sparse-reward grammars collapse the tree (later self-play
-        # iterations then produce empty trajectories). Upward death is
-        # handled by the dead-ancestor cascade below, which fires only
-        # when every sibling at a level is dead.
+        # Mark only the leaf dead on -inf, never the whole path: killing the
+        # root-to-leaf chain on one bad rollout would collapse the tree. Death
+        # propagates upward only through the cascade below, once every sibling
+        # is dead.
         if value == -np.inf:
             leaf.is_dead = True
 
-        # Every finite value counts for the filtered mean (no
-        # thresholding here); Q_sum / N_passers feed
-        # PUCTSelection(q_source="filtered_mean").
+        # Every finite value counts toward the Q_sum / N_passers mean (no
+        # threshold here), read by PUCTSelection(q_source="filtered_mean").
         counts_for_filtered_mean = np.isfinite(value)
 
         node = leaf
@@ -97,38 +82,20 @@ class MaxRewardBackup(BackpropStrategy):
 
 class PercentileRewardBackup(BackpropStrategy):
     """
-    Percentile-filtered mean backup.
+    Percentile-filtered mean backup, for a noisy simulator where
+    ``MaxRewardBackup`` would pin ``Q_max`` to one lucky rollout.
 
-    ``MaxRewardBackup`` can be optimistic on noisy simulators (a single
-    lucky rollout pins ``Q_max`` forever). This strategy keeps a
-    mean-style aggregation but only over samples that clear a percentile
-    threshold.
+    The threshold is the ``percentile`` of the leaf's own ``past_rewards``
+    history (during warm-up, ``len(past_rewards) < min_samples``, it is the
+    current value so the update always counts). On each ``update(leaf, value)``:
 
-    Semantics
-    ---------
-    Percentile is a *strategy-level* config (constructor arg), not a
-    per-node field. The threshold is computed from the leaf's own
-    ``past_rewards`` history. During warm-up
-    (``len(past_rewards) < min_samples``) the threshold degenerates to
-    the current value so the update always counts.
-
-    On each call to ``update(leaf, value)``:
-
-    1. ``value == -inf`` marks **only the leaf** dead (same as
-       ``MaxRewardBackup``, never nukes the whole chain).
-    2. Finite samples are appended to ``leaf.past_rewards``.
-    3. The ancestor chain is walked root-ward. For every visited node:
-       - ``N`` increments **always**, so PUCT's exploration term sees
-         accurate visit counts even when this value is below threshold.
-       - If ``value`` is finite and ``value >= threshold``:
-         ``Q += value``, ``Q_max = max(Q_max, value)``, and the value
-         joins the ``Q_sum`` / ``N_passers`` filtered mean (the proper
-         percentile mean, read by ``PUCTSelection(q_source="filtered_mean")``).
-    4. The same dead-ancestor cascade as ``MaxRewardBackup`` runs.
-
-    vs. ``MaxRewardBackup``: aggregates as a mean of passing samples
-    instead of a running max, so noisy simulators don't peg the value to
-    one lucky sample.
+    1. ``value == -inf`` marks only the leaf dead (not the whole chain).
+    2. A finite ``value`` is appended to ``leaf.past_rewards``.
+    3. Walking leaf to root, every node's ``N`` increments (so PUCT always has
+       accurate visit counts). If ``value`` is finite and ``>= threshold`` it
+       also updates ``Q``, ``Q_max`` and the ``Q_sum`` / ``N_passers`` mean
+       read by ``PUCTSelection(q_source="filtered_mean")``.
+    4. The same dead cascade as ``MaxRewardBackup`` runs.
     """
 
     def __init__(self, percentile: float = 20, min_samples: int = 10):
@@ -156,11 +123,9 @@ class PercentileRewardBackup(BackpropStrategy):
                 node.Q += value
                 if value > node.Q_max:
                     node.Q_max = value
-                # The "filtered mean" under percentile-backup is the
-                # mean of *passing* values: Q_sum/N_passers updates
-                # only when the value passed the threshold. This is
-                # the correct percentile mean, distinct from Q/N
-                # (which dilutes the numerator over all visits).
+                # Q_sum / N_passers is the mean of the values that passed the
+                # threshold -- the percentile mean read by selection, distinct
+                # from Q/N which would dilute over all visits.
                 node.Q_sum += float(value)
                 node.N_passers += 1
 

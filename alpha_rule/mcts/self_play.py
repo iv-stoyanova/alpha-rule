@@ -1,34 +1,22 @@
 """
 Self-play episode generator.
 
-One call produces one ``Trajectory`` of ``(state, visit_pi, reward)``
-tuples by:
+``run_self_play`` plays one episode and returns a ``Trajectory``. Starting at
+the grammar's root, for each step up to ``depth_limit`` it:
 
-    1. Starting at the root (an empty / start node).
-    2. For each construction step until ``depth_limit``:
-        a. Run ``n_simulations`` MCTS simulations from the current node.
-           - Selection uses the supplied ``selection`` (default PUCT).
-           - Backprop uses the supplied ``backup`` (default Max).
-           - Leaf rewards come from ``simulator.evaluate``.
-           - If ``network_evaluator`` is provided AND the leaf was a
-             newly-expanded child, its priors are written onto sibling
-             nodes so PUCT can use them on subsequent visits.
-        b. Compute ``visit_pi`` from the root's children's visit counts
-           with temperature ``temperature``.
-        c. Sample the next production proportional to ``visit_pi``.
-        d. Apply the production, evaluate the new state's reward,
-           record the trajectory step.
-    3. Return the ``Trajectory``.
+    1. runs ``n_simulations`` MCTS simulations from the current node
+       (select -> expand -> evaluate the leaf -> back the value up),
+    2. turns the root's child visit counts into a policy ``visit_pi``,
+    3. samples the next production from ``visit_pi`` and moves to that child,
+    4. records a ``TrajectoryStep`` (state, policy, value target, reward).
 
-The search loop is kept local (rather than a generic helper) because
-self-play needs both (a) the visit distribution at the root after each
-round of simulations and (b) progressive replanting of the root after
-each chosen production.
+The search loop lives here rather than in a shared helper because self-play
+needs the visit distribution at the root after each round and re-roots the
+tree at every chosen production.
 """
 from __future__ import annotations
 
 import math
-import os
 from typing import Iterable, List, Optional, Set
 
 import numpy as np
@@ -38,13 +26,9 @@ from alpha_rule.grammar.grammar import Grammar
 from alpha_rule.mcts.backprop import BackpropStrategy, MaxRewardBackup
 from alpha_rule.mcts.expansion import ExpansionStrategy, RuleExpansion
 from alpha_rule.mcts.node import MCTSRuleNode
-from alpha_rule.mcts.replay import DEFAULT_REWARD_FLOOR, Trajectory, TrajectoryStep
+from alpha_rule.mcts.replay import Trajectory, TrajectoryStep
 from alpha_rule.mcts.selection import PUCTSelection, SelectionStrategy
-
-
-def _debug_enabled() -> bool:
-    """Diagnostic prints are gated by the ``MCTS_DEBUG`` env var."""
-    return False
+from alpha_rule.mcts.value_target import ValueTarget, default_value_target
 
 
 def _to_eval_result(raw) -> EvalResult:
@@ -57,10 +41,9 @@ def _to_eval_result(raw) -> EvalResult:
 
 def _multi_sample_chosen_reward(simulator: Evaluator, node, n: int) -> float:
     """
-    Evaluate ``node`` ``n`` times and return the mean of the finite
-    samples (``-inf`` if every sample was non-finite). ``n > 1`` reduces
-    variance from a stochastic simulator (e.g. a freshly-trained
-    Q-learning agent per rule).
+    Evaluate ``node`` ``n`` times and return the mean of the finite samples
+    (``-inf`` if none were finite). ``n > 1`` averages out the noise of a
+    stochastic simulator (a freshly-trained Q-agent per rule).
     """
     finite_sum = 0.0
     finite_count = 0
@@ -70,39 +53,6 @@ def _multi_sample_chosen_reward(simulator: Evaluator, node, n: int) -> float:
             finite_sum += v
             finite_count += 1
     return (finite_sum / finite_count) if finite_count > 0 else float("-inf")
-
-
-def _compute_root_value(
-    parent: MCTSRuleNode,
-    *,
-    dead_penalty: float = DEFAULT_REWARD_FLOOR,
-) -> Optional[float]:
-    """
-    MCTS root value at ``parent``: visit-weighted average of children's
-    ``Q_max`` over the rollouts that completed from ``parent`` so far.
-
-    Dead-aware: children whose ``Q_max`` is ``-inf`` (every observed
-    rollout from that subtree was a failure) contribute ``dead_penalty``
-    instead of ``-inf`` so the average stays finite and the value head
-    can learn "this state has dead branches mean lower value". Without the
-    substitution the average would be ``-inf``, breaking MSE.
-
-    Returns ``None`` when no usable statistic exists yet, either no
-    child has been visited or the only visited children produced a
-    non-finite weighted sum even after substitution. Callers should
-    treat ``None`` as "fall back to a different target" rather than
-    propagate it into the NN.
-    """
-    visited = [c for c in parent.children if c.N > 0]
-    total_n = sum(c.N for c in visited)
-    if total_n <= 0:
-        return None
-    weighted_sum = 0.0
-    for c in visited:
-        q = c.Q_max if math.isfinite(c.Q_max) else float(dead_penalty)
-        weighted_sum += c.N * q
-    raw = weighted_sum / total_n
-    return raw if math.isfinite(raw) else None
 
 
 def _normalised_visit_distribution(
@@ -136,7 +86,7 @@ def _normalised_visit_distribution(
 def _sample_action(visit_pi: dict, rng: np.random.Generator) -> str:
     actions = list(visit_pi.keys())
     probs = np.array(list(visit_pi.values()), dtype=np.float64)
-    probs = probs / probs.sum()                  # paranoid renorm
+    probs = probs / probs.sum()                  # renormalise to be safe
     return actions[int(rng.choice(len(actions), p=probs))]
 
 
@@ -168,22 +118,18 @@ def _apply_root_dirichlet_noise(
     rng: np.random.Generator,
 ) -> None:
     """
-    AlphaZero-style Dirichlet noise on the MCTS search-ROOT's children
-    priors. Leaves subtree priors untouched, only the root node itself
-    gets noised, which is the canonical recipe from Silver et al.
+    Mix Dirichlet noise into the search root's child priors (AlphaZero's
+    exploration trick). Only the root's own children are noised:
 
-        p_new[a] = (1 - eps) * p_old[a] + eps * noise[a]
-        noise ~ Dir([alpha] * k)   where k = #live children.
+        prior <- (1 - eps) * prior + eps * noise,   noise ~ Dir(alpha * k)
 
-    Enables residual exploration of branches PUCT would otherwise
-    permanently starve (e.g. a child whose first visit returned a very
-    negative Q). ``eps = 0`` is a no-op.
+    with ``k`` = number of live children. This keeps PUCT exploring branches it
+    would otherwise starve (e.g. a child whose first visit looked bad).
+    ``eps = 0`` is a no-op.
 
-    This function assumes ``root.children`` has already been populated
-    (i.e. the root has been fully expanded) and its children's priors
-    have been written, so the mix has something meaningful to blend
-    with. ``run_self_play`` calls this between rounds; callers who use
-    it directly should ensure the same invariant.
+    Assumes the root is already expanded and its children's priors are set, so
+    there is something to blend with. ``run_self_play`` ensures this; direct
+    callers must too.
     """
     if eps <= 0.0:
         return
@@ -210,20 +156,18 @@ def _run_one_round(
     dead_rule_names: Optional[Set[str]] = None,
 ) -> None:
     """
-    Run ``n_simulations`` MCTS simulations rooted at ``root``. Mutates
-    ``root`` and its subtree in place.
+    Run ``n_simulations`` simulations from ``root``, updating the subtree in
+    place.
 
-    ``leaf_eval_mode`` controls where the leaf value comes from:
-        ``"nn"``: network's value head at non-terminal leaves;
-            ``simulator`` only at terminal leaves. Falls back to the
-            simulator silently when ``network_evaluator`` is ``None``.
-        ``"simulator"``: simulator at every leaf.
+    ``leaf_eval_mode`` picks where a leaf's value comes from:
+        ``"nn"``        network value head at non-terminal leaves, simulator at
+                        terminal leaves (falls back to the simulator if there
+                        is no ``network_evaluator``).
+        ``"simulator"`` simulator at every leaf.
 
-    ``dead_rule_names`` (optional): set of rule-name strings already
-    known to evaluate to ``-inf`` from a prior episode. Any new child
-    whose ``name`` matches is marked ``is_dead=True`` immediately, so
-    PUCT never visits it. Saves a full ``simulator.evaluate`` call (a
-    Q-learning training run) per revisit.
+    ``dead_rule_names`` is an optional set of rule names already known to score
+    ``-inf``. A newly-expanded child whose name is in the set is marked dead at
+    once, so PUCT skips it and no simulator call is spent on it.
     """
     for _ in range(n_simulations):
         node = root
@@ -237,40 +181,27 @@ def _run_one_round(
         if node is None:
             continue
 
-        # Expansion. Skip for terminal nodes: expanding "A <END>" into
-        # "A <END> <" is semantically incoherent (the rule already
-        # ended). The terminal itself is still a valid simulation
-        # target, simulator.evaluate strips the <END> marker.
+        # Don't expand a terminal node ("A <END>" has no continuations); it is
+        # still a valid leaf to evaluate (the simulator ignores the <END>).
         if not node.is_terminal and not node.is_fully_expanded():
             new_child = expansion.expand(node)
             if new_child is None:
                 continue
             node = new_child
-            # Cross-episode dead-rule masking. If this rule was seen to
-            # return -inf in a previous self-play episode, mark it dead
-            # before any rollout reaches it. PUCTSelection.score short-
-            # circuits is_dead children, and the dead-ancestor cascade
-            # in MaxRewardBackup handles propagation upward when every
-            # sibling is dead.
+            # If this rule already scored -inf in an earlier episode, mark it
+            # dead now so no rollout spends a simulator call on it.
             if dead_rule_names and node.name in dead_rule_names:
                 node.is_dead = True
-            # Ask the network for priors on the parent (which now has
-            # this newly-expanded child plus possibly siblings) so PUCT
-            # can use them on later visits.
+            # Ask the network for priors on the parent so PUCT can use them on
+            # later visits.
             if network_evaluator is not None and node.parent is not None:
                 prior_result = network_evaluator.evaluate(node.parent)
                 _write_priors(node.parent, prior_result.priors)
 
-        # Simulation. AlphaZero-style: at non-terminal leaves the value
-        # comes from the network's value head; at terminal leaves we
-        # still pay the cost of a real ``simulator.evaluate`` so MCTS
-        # gets ground-truth grounding at the most informative state.
-        # Short-circuit dead rules, both the simulator and the network
-        # would burn cycles on a rule whose -inf outcome is already known.
+        # Evaluate the leaf and back its value up. A known-dead node scores
+        # -inf with no simulator/network call.
         if getattr(node, "is_dead", False):
             backup.update(node, float("-inf"))
-            if _debug_enabled():
-                print(f"[eval] {node.name!r} -> SKIPPED (known dead)", flush=True)
             continue
         is_terminal_leaf = getattr(node, "is_terminal", False)
         if (
@@ -282,8 +213,6 @@ def _run_one_round(
         else:
             result = _to_eval_result(simulator.evaluate(node))
         backup.update(node, result.value)
-        if _debug_enabled():
-            print(f"[eval] {node.name!r} -> value={result.value:+.6f}", flush=True)
 
 
 def run_self_play(
@@ -302,61 +231,50 @@ def run_self_play(
     dirichlet_alpha: float = 0.3,
     forbidden_root_actions: Optional[Iterable[str]] = None,
     leaf_eval_mode: str = "nn",
-    reward_floor: float = DEFAULT_REWARD_FLOOR,
+    value_target: Optional[ValueTarget] = None,
+    value_scale: Optional[float] = None,
     dead_rule_names: Optional[Set[str]] = None,
 ) -> Trajectory:
     """
     Run one self-play episode and return its ``Trajectory``.
 
     Args:
-        grammar: production set.
-        simulator: expensive evaluator (e.g. ``RuleSimulator``).
-        network_evaluator: optional cheap evaluator that supplies priors
-            (``EvalResult.priors``) on newly-expanded nodes. If None,
-            child priors stay at the default ``1.0`` and PUCT degenerates
-            toward an unguided (prior-free) search.
-        n_simulations: MCTS simulations per construction step.
-        depth_limit: max number of construction steps. (Each step adds
-            one production, equivalent to a level on the tree.)
-        temperature: softmax temperature for visit-count sampling.
+        grammar: the production set / search space.
+        simulator: the expensive evaluator (e.g. ``RuleSimulator``).
+        network_evaluator: optional cheap evaluator supplying child priors
+            (``EvalResult.priors``). Without it, priors stay at ``1.0`` and
+            PUCT searches unguided.
+        n_simulations: MCTS simulations per step.
+        depth_limit: max construction steps (each adds one production).
+        temperature: temperature for the visit-count sampling.
         selection: defaults to ``PUCTSelection()``.
         backup: defaults to ``MaxRewardBackup()``.
         rng: optional ``np.random.Generator`` for reproducibility.
-        n_chosen_evals: number of independent ``simulator.evaluate``
-            samples to average when computing the chosen-step reward
-            (default 1). Larger values reduce variance from the
-            underlying stochastic simulator (e.g., a freshly-trained
-            Q-learning agent per rule); non-finite samples (``-inf``)
-            are dropped before averaging.
-        forbidden_root_actions: optional set of action names that may
-            not be taken at the search root. Implementation: the root is
-            pre-expanded and every child whose ``parent_action`` is in
-            this set is marked ``is_dead = True`` so PUCT never visits
-            it. Used by ``play_top_k`` to enforce branch-level diversity
-            across iterative ``play()`` calls. Future refinement: full
-            path-prefix masking (Trie of forbidden prefixes) for finer
-            diversity inside a branch.
-        leaf_eval_mode: ``"nn"`` (default) uses the network's value head
-            at non-terminal leaves and ``simulator`` at terminal leaves, 
-            the AlphaZero leaf-bootstrap. Falls back to ``simulator`` if
-            no ``network_evaluator`` was supplied. ``"simulator"`` uses
-            the expensive simulator at every leaf, terminal or not.
-        reward_floor: value substituted for a dead child's ``-inf``
-            ``Q_max`` when computing the per-step MCTS root value, so the
-            value target stays finite. Should match the
-            ``ReplayBuffer.reward_floor`` used downstream (default
-            ``-100.0``).
-        dead_rule_names: optional set of rule-name strings already known
-            to evaluate to ``-inf`` (e.g., accumulated across previous
-            ``run_self_play`` calls inside ``train()``). Whenever MCTS
-            expansion produces a child whose ``name`` is in the set, the
-            child is marked ``is_dead=True`` so PUCT skips it and no
-            simulator call is ever issued for it. Pre-expanded root
-            children (Dirichlet / ``forbidden_root_actions`` paths) are
-            also masked.
+        n_chosen_evals: how many simulator evaluations to average for each
+            chosen-step reward (default 1). Use > 1 to average out a noisy
+            simulator; ``-inf`` samples are dropped first.
+        forbidden_root_actions: optional action names to forbid at the root.
+            Their children are marked dead so PUCT never visits them (used to
+            diversify across repeated calls).
+        leaf_eval_mode: ``"nn"`` (default) uses the network value head at
+            non-terminal leaves and the simulator at terminal leaves, falling
+            back to the simulator if no network was given. ``"simulator"`` uses
+            the simulator at every leaf.
+        value_target: how each step's value target ``z_t`` is read off the
+            search tree (see ``mcts.value_target``). Defaults to the strategy
+            matching ``backup`` (Max -> ``MaxValue``,
+            Percentile -> ``ExpectedValue``). All tree-derived targets skip
+            dead children, so the value and policy targets agree on which
+            branches exist.
+        value_scale: positive reward cap used downstream to scale targets into
+            ``[-1, +1]``. Defaults to the simulator's ``reward_scale`` if set,
+            else ``None``. Stamped onto the returned ``Trajectory``.
+        dead_rule_names: optional set of rule names already known to score
+            ``-inf`` (e.g. gathered across episodes by ``train``). Matching
+            children are marked dead on creation, so no simulator call is spent
+            on them.
     """
-    # Validate Dirichlet params early so the reject-bad-input tests
-    # don't have to wait for the first round to trip a deep assertion.
+    # Validate the Dirichlet params up front so bad input fails fast.
     if dirichlet_eps < 0.0 or dirichlet_eps > 1.0:
         raise ValueError(
             f"dirichlet_eps must be in [0, 1], got {dirichlet_eps!r}"
@@ -369,6 +287,12 @@ def run_self_play(
 
     sel = selection or PUCTSelection()
     bp = backup or MaxRewardBackup()
+    # Default the value target to the one that matches the backup operator so
+    # the value head regresses the same quantity the search optimises.
+    value_target = value_target or default_value_target(bp)
+    # Auto-read the reward scale off the simulator when not given explicitly.
+    if value_scale is None:
+        value_scale = getattr(simulator, "reward_scale", None)
     expansion = RuleExpansion(grammar)
     rng = rng or np.random.default_rng()
     forbidden: Set[str] = (
@@ -381,9 +305,8 @@ def run_self_play(
 
     root = grammar.root()
     if forbidden:
-        # Pre-expand the root and kill forbidden branches before any MCTS
-        # visits them. PUCT skips ``is_dead=True`` children, so this fully
-        # masks them.
+        # Pre-expand the root and mark forbidden branches dead before any
+        # rollout reaches them (PUCT skips dead children).
         while not root.is_fully_expanded():
             expansion.expand(root)
         for child in root.children:
@@ -395,12 +318,9 @@ def run_self_play(
     current = root
 
     for depth_step in range(depth_limit):
-        # AlphaZero-style Dirichlet noise on the search root's children.
-        # Pre-expand children and populate priors so the mix has something
-        # to blend with; noise is sampled once per construction step and
-        # persists for this depth_step's ``n_simulations`` rollouts. Skip
-        # when ``dirichlet_eps == 0`` to preserve bit-exact reproducibility
-        # of runs on older branches.
+        # Dirichlet noise on the root's child priors, once per step (skipped
+        # when eps == 0, which keeps seeded runs bit-identical). Pre-expand the
+        # children and set their priors first so there is something to mix.
         if dirichlet_eps > 0.0:
             while not current.is_fully_expanded():
                 expansion.expand(current)
@@ -426,60 +346,38 @@ def run_self_play(
             leaf_eval_mode=leaf_eval_mode,
             dead_rule_names=dead_set if dead_set else None,
         )
-        if _debug_enabled():
-            label = "root" if depth_step == 0 else f"depth={depth_step}"
-            print(f"[self_play] {label} node={current.name!r} children:", flush=True)
-            for child in current.children:
-                dead = " DEAD" if getattr(child, "is_dead", False) else ""
-                q = child.Q_max if np.isfinite(child.Q_max) else float("nan")
-                print(
-                    f"  action={child.parent_action!r:<40s} "
-                    f"prior={child.prior:.4f}  N={child.N:4d}  "
-                    f"Q_max={q:+.4f}{dead}",
-                    flush=True,
-                )
         visit_pi = _normalised_visit_distribution(current, temperature=temperature)
         if not visit_pi:                              # subtree dead, stop
-            if _debug_enabled():
-                print(f"[self_play] depth={depth_step} subtree dead, stopping", flush=True)
             break
         action_name = _sample_action(visit_pi, rng)
         next_node = _apply_action_to_root(current, action_name)
 
-        # Reward of the chosen state. Use the same simulator. (Two-tier
-        # variants would use the cheap eval instead in some conditions.)
-        # Multi-sample averaging reduces noise from the stochastic
-        # underlying evaluator (see ``_multi_sample_chosen_reward``).
+        # Reward of the chosen state from the simulator. Multi-sample
+        # averaging reduces noise from the stochastic underlying evaluator
+        # (see ``_multi_sample_chosen_reward``).
         chosen_reward = _multi_sample_chosen_reward(
             simulator, next_node, n_chosen_evals,
         )
-        if _debug_enabled():
-            print(
-                f"[self_play] depth={depth_step} chose action={action_name!r} "
-                f"-> next={next_node.name!r}  chosen_reward={chosen_reward:+.6f}",
-                flush=True,
-            )
+        # Stamp the realised reward on the chosen node so the RealizedReturn
+        # value target can read it (this node becomes next step's ``current``).
+        next_node.realized_reward = chosen_reward
         applicable = tuple(
             p.name for p in grammar.applicable_productions(current)
         )
-        # Capture the MCTS root value at s_t from the search-tree
-        # statistics built by the rollouts above. Dead-aware: dead
-        # children's -inf Q_max gets replaced by the reward floor so
-        # the average stays finite. None propagates a fallback to
-        # value_targets (NN never sees -inf/NaN).
-        root_value = _compute_root_value(current, dead_penalty=reward_floor)
+        # Per-step value target z_t at s_t, from the configured ValueTarget
+        # over the search tree built above (dead children excluded; ``None``
+        # -> value_targets falls back to a finite per-step default).
+        state_value = value_target.state_value(current)
         steps.append(TrajectoryStep(
             state=current.name,           # s_t, policy target lives here
             visit_pi=visit_pi,
             reward=chosen_reward,         # R(s_{t+1}), describes next_node
             next_state=next_node.name,    # s_{t+1}, the rule the reward rates
             applicable_actions=applicable,  # train-time softmax mask source
-            root_value=root_value,        # ExIt-style value target at s_t
+            state_value=state_value,      # value target z_t at s_t
         ))
         current = next_node
         if grammar.is_terminal(current):
             break
 
-    # print(f"depth limit: {depth_limit}")
-    # print(f"Trajectory steps: {steps}")
-    return Trajectory(steps=steps)
+    return Trajectory(steps=steps, value_scale=value_scale)
