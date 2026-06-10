@@ -169,6 +169,13 @@ def _run_one_round(
     ``-inf``. A newly-expanded child whose name is in the set is marked dead at
     once, so PUCT skips it and no simulator call is spent on it.
     """
+    # Nothing to search if the root is fully expanded and all its children are
+    # dead (e.g. every root action forbidden, or a cascade-killed subtree).
+    # Without this guard each simulation would re-evaluate the root itself --
+    # a wasted simulator call per simulation.
+    if root.is_fully_expanded() and root.children and all(c.is_dead for c in root.children):
+        return
+
     for _ in range(n_simulations):
         node = root
 
