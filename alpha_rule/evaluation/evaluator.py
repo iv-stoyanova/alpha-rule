@@ -11,12 +11,15 @@ selection uses for the newly expanded children; an evaluator that does not
 produce priors leaves it ``None``.
 
 The protocol is declared with ``runtime_checkable`` so callers can do
-``isinstance(obj, Evaluator)`` without nominal inheritance.
+``isinstance(obj, Evaluator)`` without nominal inheritance. Note that the
+check only confirms an ``evaluate`` attribute exists -- not that it is
+callable or has the right signature -- so it is a structural-typing
+convenience, not a validity guard.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Dict, Optional, Protocol, runtime_checkable
+from dataclasses import dataclass
+from typing import Dict, Protocol, runtime_checkable
 
 
 @dataclass
@@ -33,7 +36,7 @@ class EvalResult:
     """
 
     value: float
-    priors: Optional[Dict[str, float]] = field(default=None)
+    priors: Dict[str, float] | None = None
 
 
 @runtime_checkable

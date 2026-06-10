@@ -21,6 +21,8 @@ from typing import List, Sequence
 from alpha_rule.grammar.grammar import Grammar
 from alpha_rule.grammar.production import Production
 from alpha_rule.helpers.matrix_operations import AllenRelation
+from alpha_rule.mcts.node import MCTSRuleNode
+from alpha_rule.rules.allen_matrix import AllenMatrix
 
 
 END_RULE = "END_RULE"
@@ -34,13 +36,14 @@ def should_add_event(level: int) -> bool:
     Allen relation (False).
 
     Event positions follow the triangular-number schedule: 0, 1, 3, 6, 10,
-    15, ... are event indices; all others are relations.
+    15, ... are event indices; all others are relations. ``level`` is an
+    event index iff it is a triangular number ``T_n = n(n+1)/2``, i.e. iff
+    ``8*level + 1`` is a perfect square. Tested exactly with ``math.isqrt``
+    (no floating-point rounding, unlike ``math.sqrt``).
     """
-    if level == 0:
-        return True
-    step = level + 1
-    n = (-1 + math.sqrt(1 + 8 * (step - 1))) / 2
-    return n.is_integer()
+    discriminant = 1 + 8 * level
+    root = math.isqrt(discriminant)
+    return root * root == discriminant
 
 
 class AllenIntervalGrammar(Grammar):
@@ -76,8 +79,6 @@ class AllenIntervalGrammar(Grammar):
         known up front, so we pass it straight to the constructor instead of
         building the node and counting afterwards.
         """
-        from alpha_rule.mcts.node import MCTSRuleNode  # local import: avoid cycle
-
         return MCTSRuleNode(
             name="<ROOT>",
             level=0,
@@ -96,13 +97,17 @@ class AllenIntervalGrammar(Grammar):
         """
         if getattr(state, "is_terminal", False):
             return []
-        if should_add_event(state.level):
-            base = list(self._event_productions)
-        else:
-            base = list(self._relation_productions)
+        base = (
+            self._event_productions
+            if should_add_event(state.level)
+            else self._relation_productions
+        )
+        # A non-root state can always finish, so prepend END_RULE. The "*base"
+        # unpack builds one fresh list (no separate defensive copy); the root
+        # path returns its own fresh list so callers can't mutate the cache.
         if state.name != "<ROOT>":
-            return [self._end_rule] + base
-        return base
+            return [self._end_rule, *base]
+        return list(base)
 
     def apply(self, state, production: Production):
         """
@@ -114,8 +119,6 @@ class AllenIntervalGrammar(Grammar):
         schedule is due for (an event where a relation is expected, or the
         other way round).
         """
-        from alpha_rule.rules.allen_matrix import AllenMatrix
-
         if production.kind == "terminal":
             # END_RULE keeps the parent's matrix and yields a terminal node.
             return self._child(
@@ -133,8 +136,13 @@ class AllenIntervalGrammar(Grammar):
                 f"got {production.kind!r} ({production.name!r})"
             )
 
-        # Keep the first ``level`` tokens of the parent name (dropping any
-        # unfilled placeholder slots), then append the new token.
+        # Keep the first ``level`` tokens of the parent name, then append the
+        # new token. ``new_rule_str`` is the clean, padding-free name; use it
+        # directly as the node name so names never carry the "#" matrix filler
+        # (which is not in ``vocab()``). The matrix unparse
+        # (``get_hierarchy_string``) would re-pad open relation slots with "#"
+        # -- correct as a matrix view, wrong as a token sequence. The terminal
+        # branch above inherits this clean parent name too.
         name_prefix = "" if state.level == 0 else " ".join(state.name.split()[: state.level])
         new_rule_str = f"{name_prefix} {production.name}".strip()
 
@@ -142,7 +150,7 @@ class AllenIntervalGrammar(Grammar):
         return self._child(
             state,
             production,
-            name=new_matrix.get_hierarchy_string(),
+            name=new_rule_str,
             rule=new_matrix,
             is_terminal=False,
         )
@@ -163,8 +171,6 @@ class AllenIntervalGrammar(Grammar):
         ``n_possible_actions`` count live, so ``root`` and ``apply`` stay
         short.
         """
-        from alpha_rule.mcts.node import MCTSRuleNode  # local import: avoid cycle
-
         child = MCTSRuleNode(
             name=name,
             level=parent.level + 1,
@@ -173,6 +179,15 @@ class AllenIntervalGrammar(Grammar):
             rule=rule,
             is_terminal=is_terminal,
         )
-        child.n_possible_actions = len(self.applicable_productions(child))
+        # Count legal actions arithmetically instead of building the Production
+        # list just to ``len()`` it (this runs for every node). Must mirror
+        # ``applicable_productions``: a terminal has none; any other child is
+        # never <ROOT>, so END_RULE is always available on top of the events or
+        # relations the schedule is due for.
+        if is_terminal:
+            child.n_possible_actions = 0
+        else:
+            base = len(self.event_types) if should_add_event(child.level) else len(self.relations)
+            child.n_possible_actions = base + 1  # +1 for END_RULE
         parent.children.append(child)
         return child

@@ -16,9 +16,12 @@ Allen intervals, so the search and the network stay unchanged.
     is_terminal(state)            the stopping check
 
 The protocol is ``runtime_checkable`` so call sites can use ``isinstance``
-without nominal subclassing. ``state`` is typed loosely on purpose: the
-search threads ``MCTSRuleNode`` instances through, but the grammar only
-relies on the small surface above and never reaches into MCTS statistics.
+without nominal subclassing -- though that only confirms the five method
+names are present, not their signatures or that they are callable, so it is
+a structural-typing convenience rather than a correctness guard. ``state``
+is typed loosely on purpose: the search threads ``MCTSRuleNode`` instances
+through, but the grammar only relies on the small surface above and never
+reaches into MCTS statistics.
 
 Example: a minimal grammar over binary strings, with no Allen logic. Any
 object exposing these five methods satisfies the protocol.

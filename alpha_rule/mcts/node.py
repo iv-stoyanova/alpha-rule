@@ -61,6 +61,16 @@ class MCTSRuleNode:
                        Defaults to 1.0 until a network sets it.
     """
 
+    # Pure-state node held at every tree position, so drop the per-instance
+    # __dict__: less memory per node and faster attribute reads/writes in
+    # selection/backprop. Every attribute the node ever carries is listed here;
+    # adding one elsewhere (e.g. a future search module) must be added here too.
+    __slots__ = (
+        "name", "level", "parent", "parent_action", "children", "rule",
+        "is_terminal", "is_dead", "n_possible_actions",
+        "N", "Q", "Q_max", "Q_sum", "N_passers", "past_rewards", "prior",
+    )
+
     def __init__(
         self,
         *,
@@ -105,13 +115,15 @@ class MCTSRuleNode:
         """True once every production the grammar allows here has a child."""
         return len(self.children) >= self.n_possible_actions
 
-    def __repr__(self, level: int = 0) -> str:
-        indent = " " * (level * 4)
+    def __repr__(self, depth: int = 0) -> str:
+        # ``depth`` is the indentation depth for the recursive tree print, not
+        # the node's construction ``self.level`` (printed as "L{level}" below).
+        indent = " " * (depth * 4)
         dead = ", DEAD" if self.is_dead else ""
         out = (
             f"{indent}{self.name} (L{self.level}) "
             f"[N={self.N}, Q_max={self.Q_max:.2f}, prior={self.prior:.3f}{dead}]\n"
         )
         for child in self.children:
-            out += child.__repr__(level + 1)
+            out += child.__repr__(depth + 1)
         return out
