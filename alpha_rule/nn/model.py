@@ -34,7 +34,7 @@ class AllenFormulaNet(nn.Module):
         nhead: int = 4,
         num_layers: int = 2,
         dim_feedforward: int = 128,
-        max_len: int = 64,
+        max_len: int = 256,
         dropout: float = 0.0,
         num_productions: Optional[int] = None,
     ):
@@ -49,6 +49,7 @@ class AllenFormulaNet(nn.Module):
             dim_feedforward=dim_feedforward,
             max_len=max_len,
             dropout=dropout,
+            pad_id=tokenizer.pad_id,
         )
         self.policy = PolicyHead(d_model, num_productions or tokenizer.vocab_size())
         self.value = ValueHead(d_model)
@@ -66,3 +67,16 @@ class AllenFormulaNet(nn.Module):
         """
         h = self.encoder(x)
         return self.policy(h), self.value(h)
+
+    def predict(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Gradient-free inference forward (eval mode, no autograd) for scoring
+        nodes during search -- the search never needs gradients, and this
+        avoids building the autograd graph on the per-node hot path. Restores
+        the prior train/eval mode on return."""
+        was_training = self.training
+        self.eval()
+        try:
+            with torch.inference_mode():
+                return self.forward(x)
+        finally:
+            self.train(was_training)

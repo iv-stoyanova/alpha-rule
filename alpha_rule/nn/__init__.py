@@ -22,7 +22,7 @@ def __getattr__(name: str):
     if name == "AllenFormulaNet":
         from alpha_rule.nn.model import AllenFormulaNet
         return AllenFormulaNet
-    if name in {"train_step", "collate", "TrainStepLog"}:
+    if name in {"train_step", "collate", "TrainStepLog", "default_optimizer"}:
         from alpha_rule.nn import training
         return getattr(training, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

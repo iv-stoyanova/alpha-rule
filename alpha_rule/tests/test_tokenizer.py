@@ -9,7 +9,8 @@ Pins:
     - ``decode(encode(s))`` round-trip recovers the rule string
       (modulo whitespace normalisation).
     - Padding works at the cap.
-    - Truncation triggers when the sequence is longer than ``max_len``.
+    - ``encode`` raises when the sequence is longer than ``max_len``
+      (no silent truncation that would drop EOS / the rule tail).
 """
 from __future__ import annotations
 
@@ -69,11 +70,12 @@ def test_decode_round_trip_strips_specials():
     assert tok.decode(encoded) == "A B <"
 
 
-def test_encode_truncates_when_too_long():
+def test_encode_raises_when_too_long():
     tok = _tokenizer()
-    # Force a short cap so truncation kicks in.
-    out = tok.encode("A B < > <", max_len=4)
-    assert out.shape == (4,)
+    import pytest
+    # Over-length rules must raise, not silently drop EOS / the tail.
+    with pytest.raises(ValueError):
+        tok.encode("A B < > <", max_len=4)
 
 
 def test_unknown_token_raises():

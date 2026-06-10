@@ -94,12 +94,9 @@ def collate(
         states_ids.append(model.tokenizer.encode(s_name, max_len=max_len))
         pi_vec = torch.zeros(vocab_size, dtype=torch.float32)
         for tok, p in visit_pi.items():
-            if tok in model.tokenizer.id_of:
-                pi_vec[model.tokenizer.id_of[tok]] = float(p)
-        # Renormalise in case the dict didn't sum to 1.
-        s = pi_vec.sum().item()
-        if s > 0:
-            pi_vec /= s
+            tok_id = model.tokenizer.id_of.get(tok)
+            if tok_id is not None:
+                pi_vec[tok_id] = float(p)
         pi_targets.append(pi_vec)
         z_targets.append(float(z))
         if has_mask:
@@ -110,9 +107,15 @@ def collate(
                     mask[tok_id] = True
             masks.append(mask)
 
+    # Renormalise every policy-target row once (vectorised) in case a visit_pi
+    # dict didn't sum to 1. All-zero rows stay all zeros.
+    target_pi = torch.stack(pi_targets, dim=0)
+    row_sums = target_pi.sum(dim=-1, keepdim=True)
+    target_pi = target_pi / torch.where(row_sums > 0, row_sums, torch.ones_like(row_sums))
+
     out = (
         torch.stack(states_ids, dim=0),
-        torch.stack(pi_targets, dim=0),
+        target_pi,
         torch.tensor(z_targets, dtype=torch.float32),
     )
     if has_mask:
@@ -187,3 +190,19 @@ def train_step(
         policy=float(policy_loss.detach().item()),
         value=float(value_loss.detach().item()),
     )
+
+
+def default_optimizer(
+    model: AllenFormulaNet,
+    *,
+    lr: float = 1e-3,
+    weight_decay: float = 1e-4,
+) -> torch.optim.Optimizer:
+    """Adam with AlphaZero-style L2 weight regularisation.
+
+    The AlphaGo-Zero / AlphaZero loss includes a ``c * ||theta||^2`` term;
+    ``train_step`` does not add it to the loss, so it is applied here via the
+    optimiser's ``weight_decay`` (the standard PyTorch way). Pass the result
+    as the ``optimizer`` argument to ``train_step``.
+    """
+    return torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)

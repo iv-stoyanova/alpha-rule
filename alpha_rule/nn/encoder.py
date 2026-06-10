@@ -28,12 +28,14 @@ class FormulaEncoder(nn.Module):
         nhead: int = 4,
         num_layers: int = 2,
         dim_feedforward: int = 128,
-        max_len: int = 64,
+        max_len: int = 256,
         dropout: float = 0.0,
+        pad_id: int = 0,
     ):
         super().__init__()
         self.d_model = d_model
         self.max_len = max_len
+        self.pad_id = pad_id
         self.token_embed = nn.Embedding(vocab_size, d_model)
         self.pos_embed = nn.Embedding(max_len, d_model)
         layer = nn.TransformerEncoderLayer(
@@ -43,7 +45,12 @@ class FormulaEncoder(nn.Module):
             dropout=dropout,
             batch_first=True,
         )
-        self.trunk = nn.TransformerEncoder(layer, num_layers=num_layers)
+        # enable_nested_tensor=False: avoid the prototype nested-tensor fast
+        # path (it only warns and the output is identical), for predictable
+        # behaviour with the padding mask.
+        self.trunk = nn.TransformerEncoder(
+            layer, num_layers=num_layers, enable_nested_tensor=False,
+        )
         # CLS-style learned pooler: BERT pattern. Linear projection +
         # Tanh keeps activations bounded so downstream heads see a
         # well-scaled signal.
@@ -67,5 +74,9 @@ class FormulaEncoder(nn.Module):
             raise ValueError(f"Input length {L} > max_len {self.max_len}")
         positions = torch.arange(L, device=x.device).unsqueeze(0).expand(B, L)
         h = self.token_embed(x) + self.pos_embed(positions)
-        h = self.trunk(h)
+        # Mask PAD positions so they don't attend or leak into the BOS pool;
+        # without this the same rule encodes differently at different padding
+        # lengths. BOS (position 0) is never PAD, so no row is fully masked.
+        pad_mask = x == self.pad_id                     # (B, L), True = ignore
+        h = self.trunk(h, src_key_padding_mask=pad_mask)
         return self.pooler(h[:, 0, :])                  # CLS-style pool

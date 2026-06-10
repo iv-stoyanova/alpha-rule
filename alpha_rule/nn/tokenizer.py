@@ -69,22 +69,29 @@ class GrammarTokenizer:
 
     def encode(self, rule_string: str, max_len: int):
         """
-        Tokenise ``rule_string``, prepend BOS, append EOS, pad to
-        ``max_len`` with PAD. Returns a 1-D ``torch.LongTensor`` of
-        length ``max_len`` (truncated from the right if too long).
+        Tokenise ``rule_string``, prepend BOS, append EOS, pad to ``max_len``
+        with PAD. Returns a 1-D ``torch.LongTensor`` of length ``max_len``.
+
+        Raises ``ValueError`` if the rule needs more than ``max_len`` tokens,
+        rather than silently right-truncating (which would drop EOS and the
+        ``<END>`` terminator). A k-event rule needs about ``k(k+1)/2 + 3``
+        tokens, so size ``max_len`` to your largest rule (e.g. ~20 events
+        needs ~213).
         """
         import torch  # lazy
 
         tokens = rule_string.split() if rule_string else []
-        # Replace the empty-root sentinel "<ROOT>" with no tokens so
-        # the encoded sequence is just BOS + EOS + padding.
+        # Drop the empty-root sentinel "<ROOT>" so the encoded sequence is
+        # just BOS + EOS + padding.
         tokens = [t for t in tokens if t != "<ROOT>"]
 
         ids = [self.bos_id] + [self._lookup(t) for t in tokens] + [self.eos_id]
         if len(ids) > max_len:
-            ids = ids[:max_len]
-        else:
-            ids = ids + [self.pad_id] * (max_len - len(ids))
+            raise ValueError(
+                f"Rule needs {len(ids)} tokens (BOS + {len(tokens)} + EOS) but "
+                f"max_len={max_len}. Increase max_len to fit your largest rule."
+            )
+        ids = ids + [self.pad_id] * (max_len - len(ids))
         return torch.tensor(ids, dtype=torch.long)
 
     def decode(self, ids) -> str:
