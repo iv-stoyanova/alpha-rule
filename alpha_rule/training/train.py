@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import math
 import time
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Iterable, List, Optional, Set, Tuple
 
@@ -48,13 +49,50 @@ from alpha_rule.mcts.self_play import run_self_play
 
 @dataclass
 class IterationLog:
+    """One row of the training log: everything measured for a single
+    self-play + train iteration. The ``AlphaZeroCSVLogger`` callback turns
+    one of these into one CSV row."""
+
     iteration: int
+    """Zero-based iteration index (the loop counter in ``train``)."""
+
     trajectory_length: int
+    """Number of construction steps the self-play episode produced, i.e.
+    ``len(traj.steps)`` from ``run_self_play``. Bounded by ``depth_limit``;
+    shorter when the episode hit a terminal rule or a dead subtree early."""
+
     best_reward_in_trajectory: float
+    """Highest finite simulator reward seen among this episode's steps, as
+    picked by ``_best_in_trajectory``. ``-inf`` if every step failed."""
+
     n_failed_evaluations: int
+    """How many of this episode's chosen steps scored a non-finite reward
+    (``-inf``, a structural match failure), counted by ``_failed_count`` on
+    the raw trajectory before any dead-rule bookkeeping."""
+
     train_total: float = 0.0
+    """Mean total loss across this iteration's ``train_step`` calls
+    (policy + value, each weighted). ``0.0`` while the buffer is still
+    below ``buffer_warmup`` and no training ran."""
+
     train_policy: float = 0.0
+    """Mean policy (soft-label cross-entropy) loss from ``train_step``."""
+
     train_value: float = 0.0
+    """Mean value (MSE) loss from ``train_step``."""
+
+    n_dead_rules: int = 0
+    """Cumulative number of distinct rule names known to score ``-inf`` so
+    far (the size of ``train``'s persistent ``dead_rules`` set after this
+    iteration). Grows monotonically; how much of the search space has been
+    pruned out of future simulator calls."""
+
+    buffer_fill_fraction: float = 0.0
+    """Fraction of the replay buffer's capacity in use after this
+    iteration's push, in ``[0, 1]`` (``ReplayBuffer.fill_fraction``). Near
+    1.0 means the buffer is evicting old targets each iteration; very low
+    means the capacity dwarfs your throughput."""
+
     best_formula_in_trajectory: Optional[str] = None
     """Name of the rule that earned ``best_reward_in_trajectory`` this
     iteration. ``None`` when the trajectory had no finite-reward steps
@@ -85,9 +123,23 @@ class IterationLog:
 
 @dataclass
 class TrainingLog:
+    """Return value of ``train``: the per-iteration history plus the
+    running-best rule and the artefacts ``play`` needs to run the trained
+    policy."""
+
     iterations: List[IterationLog] = field(default_factory=list)
+    """One ``IterationLog`` per iteration, in order."""
+
     best_formula: Optional[str] = None
+    """Name of the highest-reward rule seen across all self-play so far
+    (tie-broken toward the longer rule by ``_best_in_trajectory``).
+    Exploration logbook, not the trained policy's own answer -- use
+    ``play`` for that."""
+
     best_reward: float = float("-inf")
+    """Simulator reward of ``best_formula``; ``-inf`` until a finite-reward
+    rule is found."""
+
     device: Optional[str] = None
     """Resolved torch device for the policy-value network, e.g. ``"cuda:0"``
     or ``"cpu"``. Set once at the start of ``train()``."""
@@ -197,6 +249,89 @@ def _unpack_eval_tuple(raw):
     return float(raw), None, None
 
 
+def _warn_risky_config(
+    *,
+    max_len: int,
+    depth_limit: int,
+    explicit_value_scale: Optional[float],
+    simulator: Evaluator,
+    backup,
+    selection,
+    q_source: str,
+    eval_simulator,
+    eval_every: int,
+) -> None:
+    """Emit a ``warnings.warn`` for each known footgun in a ``train`` config.
+
+    Covers the combinations that don't fail loudly on their own: a token
+    budget too small for the search depth (crashes mid-episode), a value
+    scale that disagrees with the simulator's reward scale (trains on a
+    mis-scaled value target), a backup/selection pair that optimise
+    different statistics, and an eval cadence that silently runs every
+    iteration. All are non-fatal -- the run still starts.
+    """
+    # 1. Token budget vs search depth. A depth-d rule is d productions =
+    #    d + 2 token ids (BOS + EOS). The MCTS search is capped at depth_limit
+    #    (see _run_one_round), so the deepest node ever encoded sits at exactly
+    #    depth_limit and max_len >= depth_limit + 2 is both necessary AND
+    #    sufficient; below it, encode() raises inside the search.
+    if max_len < depth_limit + 2:
+        warnings.warn(
+            f"max_len={max_len} < depth_limit + 2 = {depth_limit + 2}: a rule "
+            f"built to depth_limit needs depth_limit + 2 token ids (productions "
+            f"+ BOS + EOS). The deepest self-play episodes will overflow the "
+            f"tokenizer mid-search and raise. Raise max_len to at least "
+            f"{depth_limit + 2}.",
+            stacklevel=3,
+        )
+
+    # 2. Explicit value_scale that disagrees with the simulator's reward cap.
+    #    The network value (multiplied by value_scale) and the simulator's raw
+    #    rewards (capped at reward_scale) then live on different scales in the
+    #    shared MCTS backup, and the clip to [-1, 1] is wrong for one of them.
+    sim_reward_scale = getattr(simulator, "reward_scale", None)
+    if (
+        explicit_value_scale is not None
+        and sim_reward_scale is not None
+        and abs(float(explicit_value_scale) - float(sim_reward_scale)) > 1e-9
+    ):
+        warnings.warn(
+            f"value_scale={explicit_value_scale} differs from the simulator's "
+            f"reward_scale={sim_reward_scale}: the network value and the "
+            f"simulator's raw rewards then sit on different scales in the shared "
+            f"MCTS backup, and the value target's clip to [-1, 1] is wrong for "
+            f"one of them. Pass value_scale=None to inherit reward_scale, or "
+            f"match them on purpose.",
+            stacklevel=3,
+        )
+
+    # 3. Percentile backup needs PUCT to read the percentile-filtered mean.
+    #    q_source is only consulted when selection is built from the scalars
+    #    (selection is None); an explicit selection object owns its own q_source.
+    if (
+        isinstance(backup, str) and backup == "percentile"
+        and selection is None and q_source != "filtered_mean"
+    ):
+        warnings.warn(
+            f"backup='percentile' pairs with q_source='filtered_mean', but "
+            f"q_source={q_source!r}: PUCT would read Q_max while the backup fills "
+            f"the percentile-filtered mean, so selection and backup optimise "
+            f"different statistics. Set q_source='filtered_mean'.",
+            stacklevel=3,
+        )
+
+    # 4. eval cadence. The gate uses `it % max(1, eval_every)`, so a
+    #    non-positive eval_every silently runs the (expensive) eval EVERY
+    #    iteration instead of disabling it.
+    if eval_simulator is not None and eval_every <= 0:
+        warnings.warn(
+            f"eval_every={eval_every} <= 0: the eval gate floors it to 1, so the "
+            f"(expensive) eval runs on every iteration. Use a positive cadence, "
+            f"or pass eval_simulator=None to turn eval off.",
+            stacklevel=3,
+        )
+
+
 def train(
     *,
     grammar: Grammar,
@@ -206,6 +341,7 @@ def train(
     n_simulations: int = 50,
     depth_limit: int = 5,
     temperature: float = 1.0,
+    temperature_final: Optional[float] = 0.1,
     # --- replay buffer --------------------------------------------- #
     buffer_capacity: int = 10_000,
     buffer_warmup: int = 16,
@@ -235,7 +371,7 @@ def train(
     percentile: float = 20.0,
     min_samples: int = 10,
     # --- exploration / leaf evaluation ----------------------------- #
-    dirichlet_eps: float = 0.0,
+    dirichlet_eps: float = 0.25,
     dirichlet_alpha: float = 0.3,
     leaf_eval_mode: str = "nn",
     n_chosen_evals: int = 1,
@@ -260,7 +396,17 @@ def train(
         n_iterations: number of self-play episodes.
         n_simulations: MCTS simulations per construction step.
         depth_limit: max construction steps per self-play episode.
-        temperature: visit-count sampling temperature.
+        temperature: starting temperature for the visit-count ACTION
+            sampling at iteration 0. The stored policy target is always the
+            tau=1 visit distribution (decoupled inside ``run_self_play``), so
+            annealing the sampling temperature sharpens which rule gets
+            committed without distorting the training signal.
+        temperature_final: temperature reached at the last iteration. The
+            sampling temperature is linearly annealed from ``temperature``
+            (iteration 0) to ``temperature_final`` (iteration
+            ``n_iterations - 1``): high early to explore, low late to commit
+            to what the trained net prefers. ``None`` (or equal to
+            ``temperature``) keeps it constant. Default ``0.1``.
         buffer_capacity, buffer_warmup, batch_size,
         train_steps_per_iteration: replay-buffer + training cadence.
         d_model, nhead, num_layers, max_len: ``AllenFormulaNet`` config.
@@ -317,12 +463,13 @@ def train(
         dirichlet_eps: AlphaZero-style Dirichlet noise weight applied
             to the MCTS search root's children's priors at each
             construction step. ``p' = (1-eps) * p + eps * Dir(alpha)``.
-            Default ``0.0`` disables (the default). Values
-            in ``[0.1, 0.3]`` force residual exploration of branches
-            PUCT would otherwise permanently starve (e.g. branches
-            whose first expansion returned a very negative Q). This
-            directly addresses the "buffer has 0 BAD rows" finding
-            from ``accuracy_convergence.ipynb``.
+            Default ``0.25`` (on): it forces residual exploration of
+            branches PUCT would otherwise permanently starve (e.g. branches
+            whose first expansion returned a very negative Q), directly
+            addressing the "buffer has 0 BAD rows" finding from
+            ``accuracy_convergence.ipynb``. Set ``0.0`` to disable, which
+            also makes a seeded run bit-identical across executions (the
+            noise is the only non-reproducible-by-config element).
         dirichlet_alpha: Dirichlet concentration. Lower = spikier
             noise, higher = more uniform. Ignored when
             ``dirichlet_eps == 0``. Default ``0.3`` matches the
@@ -348,6 +495,16 @@ def train(
             build the default selection strategy (see ``selection``).
             ``q_source`` is ``"max"`` (read ``Q_max``) or
             ``"filtered_mean"`` (read the percentile-filtered mean).
+            NOTE on ``c_puct`` vs reward magnitude: PUCT scores each child
+            as ``Q + c_puct * P * sqrt(sum_N) / (1 + N)`` where ``Q`` is the
+            node's value in RAW reward units (capped at ``value_scale`` /
+            the simulator's ``reward_scale``, typically ~1-4), not
+            normalised to ``[-1, 1]``. So ``c_puct`` is implicitly tied to
+            your reward magnitude: the exploration term must stay comparable
+            to ``Q`` to matter. The default ``1.5`` suits rewards capped
+            near 1; if your ``reward_scale`` is larger (say 4), scale
+            ``c_puct`` up roughly in proportion or the search collapses to
+            pure exploitation.
         percentile, min_samples: ``PercentileRewardBackup`` knobs, used
             only when ``backup="percentile"``.
 
@@ -427,6 +584,21 @@ def train(
     else:
         bp = backup
 
+    # --- Risky / inconsistent configuration warnings ----------------- #
+    # Non-fatal: surface combinations that silently misbehave so a long run
+    # doesn't crash mid-search or train against a mis-scaled signal.
+    _warn_risky_config(
+        max_len=max_len,
+        depth_limit=depth_limit,
+        explicit_value_scale=value_scale,
+        simulator=expensive_simulator,
+        backup=backup,
+        selection=selection,
+        q_source=q_source,
+        eval_simulator=eval_simulator,
+        eval_every=eval_every,
+    )
+
     log = TrainingLog(
         device=str(torch_device),
         max_len=max_len,
@@ -448,6 +620,17 @@ def train(
     dead_rules: Set[str] = set()
 
     for it in range(n_iterations):
+        # Linearly anneal the action-sampling temperature from `temperature`
+        # (iteration 0) to `temperature_final` (last iteration). The policy
+        # TARGET stored in the trajectory stays at tau=1 inside run_self_play,
+        # so this only sharpens which rule gets committed, not the training
+        # signal. `temperature_final=None` (or == temperature) keeps it fixed.
+        if temperature_final is None or n_iterations <= 1:
+            temp_it = temperature
+        else:
+            frac = it / (n_iterations - 1)
+            temp_it = temperature + (temperature_final - temperature) * frac
+
         # --- MCTS / self-play -------------------------------------- #
         t0 = time.perf_counter()
         traj = run_self_play(
@@ -456,7 +639,7 @@ def train(
             network_evaluator=network_evaluator,
             n_simulations=n_simulations,
             depth_limit=depth_limit,
-            temperature=temperature,
+            temperature=temp_it,
             selection=sel,
             backup=bp,
             rng=rng,
@@ -468,6 +651,12 @@ def train(
             dead_rule_names=dead_rules if dead_rules else None,
         )
         t_mcts_s = time.perf_counter() - t0
+
+        # Count this episode's failed (-inf) evaluations from the raw
+        # trajectory BEFORE folding those rules into the persistent dead set,
+        # so the metric reflects what this episode actually saw independent of
+        # the dead-rule bookkeeping below.
+        n_failed = _failed_count(traj)
 
         # Accumulate -inf rules seen in this episode into the persistent
         # set so future iterations can short-circuit them.
@@ -560,10 +749,12 @@ def train(
             iteration=it,
             trajectory_length=len(traj.steps),
             best_reward_in_trajectory=best_reward,
-            n_failed_evaluations=_failed_count(traj),
+            n_failed_evaluations=n_failed,
             train_total=train_total,
             train_policy=train_policy,
             train_value=train_value,
+            n_dead_rules=len(dead_rules),
+            buffer_fill_fraction=buffer.fill_fraction,
             best_formula_in_trajectory=best_state_str,
             eval_reward=eval_reward,
             eval_success_rate=eval_success,

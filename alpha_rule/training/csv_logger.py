@@ -47,6 +47,9 @@ CSV_COLUMNS = [
     "t_nn_train_s",
     "t_eval_s",
     "t_buffer_s",
+    # --- search-health additions ---
+    "n_dead_rules",
+    "buffer_fill_fraction",
 ]
 
 
@@ -191,8 +194,15 @@ class AlphaZeroCSVLogger:
         t_nn_train_s: float = 0.0,
         t_eval_s: float = 0.0,
         t_buffer_s: float = 0.0,
+        n_dead_rules: int = 0,
+        buffer_fill_fraction: Optional[float] = None,
     ) -> None:
-        """Append one row. Updates the running-best tracker."""
+        """Append one row. Updates the running-best tracker.
+
+        ``n_dead_rules`` is the cumulative count of rules known to fail
+        (``-inf``); ``buffer_fill_fraction`` is the replay buffer's occupancy
+        in ``[0, 1]``. Both come straight from the matching ``IterationLog``
+        fields and are written verbatim."""
         if math.isfinite(best_reward_in_trajectory) and \
                 best_reward_in_trajectory > self._running_best_reward:
             self._running_best_reward = best_reward_in_trajectory
@@ -230,6 +240,8 @@ class AlphaZeroCSVLogger:
                     _round(t_nn_train_s, 4),
                     _round(t_eval_s, 4),
                     _round(t_buffer_s, 4),
+                    n_dead_rules,
+                    _round(buffer_fill_fraction, 4),
                 ]
             )
 
@@ -252,6 +264,8 @@ class AlphaZeroCSVLogger:
                 t_nn_train_s=getattr(it, "t_nn_train_s", 0.0),
                 t_eval_s=getattr(it, "t_eval_s", 0.0),
                 t_buffer_s=getattr(it, "t_buffer_s", 0.0),
+                n_dead_rules=getattr(it, "n_dead_rules", 0),
+                buffer_fill_fraction=getattr(it, "buffer_fill_fraction", None),
             )
 
     # ------------------------------------------------------------------ #
@@ -298,6 +312,8 @@ class AlphaZeroCSVLogger:
                 t_nn_train_s=getattr(it_log, "t_nn_train_s", 0.0),
                 t_eval_s=getattr(it_log, "t_eval_s", 0.0),
                 t_buffer_s=getattr(it_log, "t_buffer_s", 0.0),
+                n_dead_rules=getattr(it_log, "n_dead_rules", 0),
+                buffer_fill_fraction=getattr(it_log, "buffer_fill_fraction", None),
             )
 
         return _cb

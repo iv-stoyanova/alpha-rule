@@ -154,6 +154,7 @@ def _run_one_round(
     expansion: ExpansionStrategy,
     leaf_eval_mode: str = "nn",
     dead_rule_names: Optional[Set[str]] = None,
+    depth_limit: Optional[int] = None,
 ) -> None:
     """
     Run ``n_simulations`` simulations from ``root``, updating the subtree in
@@ -168,6 +169,13 @@ def _run_one_round(
     ``dead_rule_names`` is an optional set of rule names already known to score
     ``-inf``. A newly-expanded child whose name is in the set is marked dead at
     once, so PUCT skips it and no simulator call is spent on it.
+
+    ``depth_limit`` caps the search depth: a node at ``level == depth_limit``
+    is a valid leaf to evaluate but is never expanded deeper. The committed
+    trajectory only ever reaches ``depth_limit`` productions, so searching past
+    it evaluates rules that can never be the final answer -- wasting simulator /
+    network calls and (with a tight ``max_len``) overflowing the tokenizer mid
+    search. ``None`` leaves the search uncapped.
     """
     # Nothing to search if the root is fully expanded and all its children are
     # dead (e.g. every root action forbidden, or a cascade-killed subtree).
@@ -190,7 +198,11 @@ def _run_one_round(
 
         # Don't expand a terminal node ("A <END>" has no continuations); it is
         # still a valid leaf to evaluate (the simulator ignores the <END>).
-        if not node.is_terminal and not node.is_fully_expanded():
+        # Also stop at depth_limit: a node already at the construction budget is
+        # evaluated as a leaf but never grown deeper (see the depth_limit note
+        # in the docstring).
+        can_expand = depth_limit is None or node.level < depth_limit
+        if not node.is_terminal and not node.is_fully_expanded() and can_expand:
             new_child = expansion.expand(node)
             if new_child is None:
                 continue
@@ -253,7 +265,12 @@ def run_self_play(
             PUCT searches unguided.
         n_simulations: MCTS simulations per step.
         depth_limit: max construction steps (each adds one production).
-        temperature: temperature for the visit-count sampling.
+        temperature: temperature for the action SAMPLING only. The policy
+            target stored in each step (``visit_pi``) is always the tau=1 visit
+            fractions, independent of this value, so an annealed sampling
+            temperature does not distort the training signal. ``temperature=0``
+            samples the argmax visit (greedy play); ``1.0`` samples
+            proportional to visits.
         selection: defaults to ``PUCTSelection()``.
         backup: defaults to ``MaxRewardBackup()``.
         rng: optional ``np.random.Generator`` for reproducibility.
@@ -352,11 +369,25 @@ def run_self_play(
             expansion=expansion,
             leaf_eval_mode=leaf_eval_mode,
             dead_rule_names=dead_set if dead_set else None,
+            depth_limit=depth_limit,
         )
-        visit_pi = _normalised_visit_distribution(current, temperature=temperature)
-        if not visit_pi:                              # subtree dead, stop
+        # Policy TARGET: the raw visit fractions at tau=1 -- the AlphaZero
+        # training signal stored in the trajectory and regressed by the policy
+        # head. It is computed independently of the action-sampling temperature
+        # below, so annealing the choice toward argmax never collapses the
+        # stored target to a one-hot (which would train the net to be
+        # over-confident about whichever branch the search happened to commit to).
+        target_pi = _normalised_visit_distribution(current, temperature=1.0)
+        if not target_pi:                             # subtree dead, stop
             break
-        action_name = _sample_action(visit_pi, rng)
+        # Action SAMPLING distribution at the requested (possibly annealed)
+        # temperature: tau == 1 reuses the target as-is; tau -> 0 sharpens
+        # toward the argmax visit.
+        if temperature == 1.0:
+            sample_pi = target_pi
+        else:
+            sample_pi = _normalised_visit_distribution(current, temperature=temperature)
+        action_name = _sample_action(sample_pi, rng)
         next_node = _apply_action_to_root(current, action_name)
 
         # Reward of the chosen state from the simulator. Multi-sample
@@ -377,7 +408,7 @@ def run_self_play(
         state_value = value_target.state_value(current)
         steps.append(TrajectoryStep(
             state=current.name,           # s_t, policy target lives here
-            visit_pi=visit_pi,
+            visit_pi=target_pi,           # tau=1 visit fractions (decoupled from sampling)
             reward=chosen_reward,         # R(s_{t+1}), describes next_node
             next_state=next_node.name,    # s_{t+1}, the rule the reward rates
             applicable_actions=applicable,  # train-time softmax mask source
