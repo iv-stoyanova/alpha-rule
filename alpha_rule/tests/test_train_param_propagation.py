@@ -245,3 +245,168 @@ def test_new_metrics_round_trip_through_csv_logger():
         shutil.rmtree(base_dir, ignore_errors=True)
     assert rows[0]["n_dead_rules"] == "7"
     assert rows[0]["buffer_fill_fraction"] == "0.25"
+
+
+# --------------------------------------------------------------------------- #
+# eval / best-rule connection: eval_formula records the rule the eval describes
+# --------------------------------------------------------------------------- #
+
+class _EvalSim:
+    """Returns a (reward, success, steps) triple like the real eval simulator."""
+    reward_scale = 1.0
+    def evaluate(self, node):
+        return (0.7, 1.0, 5.0)
+
+
+def test_eval_formula_paired_with_eval_metrics():
+    """eval_formula is set exactly on iterations where the eval fired, so the
+    eval_* metrics are never read against the wrong rule."""
+    log = _tiny(n_iterations=3, eval_simulator=_EvalSim(), eval_every=1)
+    for it in log.iterations:
+        if it.eval_reward is not None:
+            assert isinstance(it.eval_formula, str) and it.eval_formula
+        else:
+            assert it.eval_formula is None
+
+
+def test_eval_use_play_records_the_played_rule():
+    """Under eval_use_play the evaluated rule is play()'s answer; eval_formula
+    captures it (the disconnect with best_formula_in_trajectory is closed)."""
+    log = _tiny(n_iterations=2, eval_simulator=_EvalSim(), eval_every=1,
+                eval_use_play=True)
+    eval_iters = [it for it in log.iterations if it.eval_reward is not None]
+    assert eval_iters                                  # at least one eval fired
+    for it in eval_iters:
+        assert isinstance(it.eval_formula, str) and it.eval_formula
+
+
+# --------------------------------------------------------------------------- #
+# play() defaults its search strategies to the ones training used
+# --------------------------------------------------------------------------- #
+
+def test_train_persists_selection_and_backup_on_log():
+    from alpha_rule.mcts.backprop import PercentileRewardBackup
+    from alpha_rule.mcts.selection import PUCTSelection
+
+    log = _tiny(backup="percentile", q_source="filtered_mean", percentile=25.0)
+    assert isinstance(log.selection, PUCTSelection)
+    assert log.selection.q_source == "filtered_mean"
+    assert isinstance(log.backup, PercentileRewardBackup)
+    assert log.backup.percentile == 25.0
+
+
+def test_play_defaults_to_log_selection_and_backup():
+    """A bare play(log, ...) reproduces the training-time search: it must run
+    on a percentile-trained log without being handed selection/backup."""
+    from alpha_rule.training import play
+
+    g = _grammar(("A", "B"))
+    log = _tiny(grammar=g, backup="percentile", q_source="filtered_mean")
+    rule, _ = play(log, grammar=g, simulator=_ConstSim(1.0))
+    assert rule is not None
+
+
+# --------------------------------------------------------------------------- #
+# CSV logger fixes: eval_formula column, running-best tie-break, exclusive run
+# --------------------------------------------------------------------------- #
+
+def test_eval_formula_round_trips_and_columns_present():
+    import shutil
+    import tempfile
+
+    from alpha_rule.training.csv_logger import (
+        CSV_COLUMNS, RUN_EVAL_CSV_COLUMNS, AlphaZeroCSVLogger,
+    )
+
+    assert "eval_formula" in CSV_COLUMNS
+    assert "eval_formula" in RUN_EVAL_CSV_COLUMNS
+
+    base_dir = tempfile.mkdtemp()
+    try:
+        logger = AlphaZeroCSVLogger(base_dir=base_dir, env_name="E", activity="t")
+        logger.log_iteration(
+            iteration=0, trajectory_length=2, best_reward_in_trajectory=0.5,
+            n_failed_evaluations=0, policy_loss=0.1, value_loss=0.2, total_loss=0.3,
+            eval_reward=0.7, eval_formula="A B <",
+        )
+        with open(logger.csv_path, newline="") as f:
+            rows = list(csv.DictReader(f))
+    finally:
+        shutil.rmtree(base_dir, ignore_errors=True)
+    assert rows[0]["eval_formula"] == "A B <"
+
+
+def test_csv_running_best_prefers_longer_rule_on_tie():
+    """Matches train()'s log.best_formula tie-break (equal reward -> longer
+    rule wins), so the two never disagree."""
+    import shutil
+    import tempfile
+
+    from alpha_rule.training.csv_logger import AlphaZeroCSVLogger
+
+    base_dir = tempfile.mkdtemp()
+    try:
+        logger = AlphaZeroCSVLogger(base_dir=base_dir, env_name="E", activity="t")
+        logger.log_iteration(
+            iteration=0, trajectory_length=1, best_reward_in_trajectory=1.0,
+            n_failed_evaluations=0, policy_loss=0.0, value_loss=0.0, total_loss=0.0,
+            best_formula="A",
+        )
+        logger.log_iteration(
+            iteration=1, trajectory_length=2, best_reward_in_trajectory=1.0,
+            n_failed_evaluations=0, policy_loss=0.0, value_loss=0.0, total_loss=0.0,
+            best_formula="A B",                        # equal reward, longer
+        )
+        with open(logger.csv_path, newline="") as f:
+            rows = list(csv.DictReader(f))
+    finally:
+        shutil.rmtree(base_dir, ignore_errors=True)
+    assert rows[1]["running_best_formula"] == "A B"
+
+
+def test_csv_running_best_never_decouples_reward_and_formula():
+    """A finite, strictly-better reward with no formula must not advance the
+    reward while leaving the formula stale — the two columns always describe
+    the same rule (matches train(), which couples them)."""
+    import shutil
+    import tempfile
+
+    from alpha_rule.training.csv_logger import AlphaZeroCSVLogger
+
+    base_dir = tempfile.mkdtemp()
+    try:
+        logger = AlphaZeroCSVLogger(base_dir=base_dir, env_name="E", activity="t")
+        logger.log_iteration(
+            iteration=0, trajectory_length=1, best_reward_in_trajectory=0.5,
+            n_failed_evaluations=0, policy_loss=0.0, value_loss=0.0, total_loss=0.0,
+            best_formula="A B",
+        )
+        logger.log_iteration(
+            iteration=1, trajectory_length=1, best_reward_in_trajectory=0.9,
+            n_failed_evaluations=0, policy_loss=0.0, value_loss=0.0, total_loss=0.0,
+            best_formula=None,                          # higher reward, no name
+        )
+        with open(logger.csv_path, newline="") as f:
+            rows = list(csv.DictReader(f))
+    finally:
+        shutil.rmtree(base_dir, ignore_errors=True)
+    # Reward did not advance without a formula, so the two stay consistent.
+    assert rows[1]["running_best_reward"] == "0.5"
+    assert rows[1]["running_best_formula"] == "A B"
+
+
+def test_concurrent_loggers_get_distinct_run_files():
+    """Exclusive-create run allocation: two loggers in one dir never collide."""
+    import shutil
+    import tempfile
+
+    from alpha_rule.training.csv_logger import AlphaZeroCSVLogger
+
+    base_dir = tempfile.mkdtemp()
+    try:
+        a = AlphaZeroCSVLogger(base_dir=base_dir, env_name="E", activity="t", strategy="S")
+        b = AlphaZeroCSVLogger(base_dir=base_dir, env_name="E", activity="t", strategy="S")
+        assert a.run != b.run
+        assert a.csv_path != b.csv_path
+    finally:
+        shutil.rmtree(base_dir, ignore_errors=True)

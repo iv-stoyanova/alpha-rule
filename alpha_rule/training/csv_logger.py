@@ -50,6 +50,11 @@ CSV_COLUMNS = [
     # --- search-health additions ---
     "n_dead_rules",
     "buffer_fill_fraction",
+    # The rule the eval_* columns above actually describe (the play() result
+    # under eval_use_play, else the running-best). Kept distinct from
+    # running_best_formula so the eval numbers are never read against the
+    # wrong rule.
+    "eval_formula",
 ]
 
 
@@ -65,7 +70,22 @@ RUN_EVAL_CSV_COLUMNS = [
     "eval_episode_length",
     "activity",
     "strategy",
+    # The rule the eval_* columns describe (see CSV_COLUMNS note).
+    "eval_formula",
 ]
+
+
+def _round(value, places=6):
+    """Round a float for CSV output; blank ('') for None / non-finite / NaN.
+
+    Shared by both loggers so the two never drift on how they serialise an
+    absent metric."""
+    try:
+        if value is None or not math.isfinite(value):
+            return ""
+    except TypeError:
+        return ""
+    return str(round(float(value), places))
 
 
 def _strategy_to_filename_segment(strategy: str) -> str:
@@ -145,15 +165,24 @@ class AlphaZeroCSVLogger:
         ]
         self.run = max(indices, default=-1) + 1
 
-        self.csv_path = os.path.join(
-            base_dir, f"{env_name}_az_{strategy_fs}_{self.run}_results.csv"
-        )
+        # Allocate the run file with exclusive-create ("x") and bump the run
+        # number on collision, so two loggers started concurrently (the scan
+        # above is a check-then-act race) never overwrite each other's results.
+        while True:
+            csv_path = os.path.join(
+                base_dir, f"{env_name}_az_{strategy_fs}_{self.run}_results.csv"
+            )
+            try:
+                f = open(csv_path, "x", newline="")
+                break
+            except FileExistsError:
+                self.run += 1
+        with f:
+            csv.writer(f).writerow(CSV_COLUMNS)
+        self.csv_path = csv_path
         self.config_path = os.path.join(
             base_dir, f"{env_name}_az_{strategy_fs}_{self.run}_config.json"
         )
-
-        with open(self.csv_path, "w", newline="") as f:
-            csv.writer(f).writerow(CSV_COLUMNS)
 
         with open(self.config_path, "w") as f:
             json.dump(
@@ -196,26 +225,35 @@ class AlphaZeroCSVLogger:
         t_buffer_s: float = 0.0,
         n_dead_rules: int = 0,
         buffer_fill_fraction: Optional[float] = None,
+        eval_formula: Optional[str] = None,
     ) -> None:
         """Append one row. Updates the running-best tracker.
 
         ``n_dead_rules`` is the cumulative count of rules known to fail
         (``-inf``); ``buffer_fill_fraction`` is the replay buffer's occupancy
-        in ``[0, 1]``. Both come straight from the matching ``IterationLog``
-        fields and are written verbatim."""
-        if math.isfinite(best_reward_in_trajectory) and \
-                best_reward_in_trajectory > self._running_best_reward:
-            self._running_best_reward = best_reward_in_trajectory
-            if best_formula is not None:
+        in ``[0, 1]``; ``eval_formula`` is the rule the ``eval_*`` metrics
+        describe. All come straight from the matching ``IterationLog`` fields
+        and are written verbatim."""
+        # Running-best update mirrors train()'s ``log.best_formula`` rule
+        # (strict reward improvement OR equal reward with a longer formula), so
+        # this column never disagrees with the TrainingLog's best. Reward and
+        # formula advance TOGETHER and only when a formula is present (like
+        # train(), which guards the whole update on best_state is not None), so
+        # the two columns can never end up describing different rules.
+        if math.isfinite(best_reward_in_trajectory) and best_formula is not None:
+            cand_len = len(best_formula.split())
+            prev_len = (
+                len(self._running_best_formula.split())
+                if self._running_best_formula else -1
+            )
+            strict_better = best_reward_in_trajectory > self._running_best_reward
+            tie_longer = (
+                best_reward_in_trajectory == self._running_best_reward
+                and cand_len > prev_len
+            )
+            if strict_better or tie_longer:
+                self._running_best_reward = best_reward_in_trajectory
                 self._running_best_formula = best_formula
-
-        def _round(value, places=6):
-            try:
-                if value is None or not math.isfinite(value):
-                    return ""
-            except TypeError:
-                return ""
-            return str(round(float(value), places))
 
         with open(self.csv_path, "a", newline="") as f:
             csv.writer(f).writerow(
@@ -242,6 +280,7 @@ class AlphaZeroCSVLogger:
                     _round(t_buffer_s, 4),
                     n_dead_rules,
                     _round(buffer_fill_fraction, 4),
+                    eval_formula or "",
                 ]
             )
 
@@ -266,6 +305,7 @@ class AlphaZeroCSVLogger:
                 t_buffer_s=getattr(it, "t_buffer_s", 0.0),
                 n_dead_rules=getattr(it, "n_dead_rules", 0),
                 buffer_fill_fraction=getattr(it, "buffer_fill_fraction", None),
+                eval_formula=getattr(it, "eval_formula", None),
             )
 
     # ------------------------------------------------------------------ #
@@ -314,6 +354,7 @@ class AlphaZeroCSVLogger:
                 t_buffer_s=getattr(it_log, "t_buffer_s", 0.0),
                 n_dead_rules=getattr(it_log, "n_dead_rules", 0),
                 buffer_fill_fraction=getattr(it_log, "buffer_fill_fraction", None),
+                eval_formula=getattr(it_log, "eval_formula", None),
             )
 
         return _cb
@@ -397,15 +438,23 @@ class RunLevelEvalLogger:
         ]
         self.run = max(indices, default=-1) + 1
 
-        self.csv_path = os.path.join(
-            base_dir, f"{env_name}_run_eval_{self.run}_results.csv"
-        )
+        # Exclusive-create the run file (bump on collision) so concurrent
+        # loggers never clobber each other -- see AlphaZeroCSVLogger.__init__.
+        while True:
+            csv_path = os.path.join(
+                base_dir, f"{env_name}_run_eval_{self.run}_results.csv"
+            )
+            try:
+                f = open(csv_path, "x", newline="")
+                break
+            except FileExistsError:
+                self.run += 1
+        with f:
+            csv.writer(f).writerow(RUN_EVAL_CSV_COLUMNS)
+        self.csv_path = csv_path
         self.config_path = os.path.join(
             base_dir, f"{env_name}_run_eval_{self.run}_config.json"
         )
-
-        with open(self.csv_path, "w", newline="") as f:
-            csv.writer(f).writerow(RUN_EVAL_CSV_COLUMNS)
 
         with open(self.config_path, "w") as f:
             json.dump(
@@ -468,17 +517,13 @@ class RunLevelEvalLogger:
         eval_reward: Optional[float],
         eval_success_rate: Optional[float],
         eval_episode_length: Optional[float],
+        eval_formula: Optional[str] = None,
     ) -> None:
-        """Append one eval row. Caller must have called ``set_context`` first."""
+        """Append one eval row. Caller must have called ``set_context`` first.
 
-        def _round(value, places=6):
-            try:
-                if value is None or not math.isfinite(value):
-                    return ""
-            except TypeError:
-                return ""
-            return str(round(float(value), places))
-
+        ``running_best_formula`` is the training-side best (for context);
+        ``eval_formula`` is the rule the ``eval_*`` numbers actually describe
+        (they differ under ``eval_use_play``)."""
         with open(self.csv_path, "a", newline="") as f:
             csv.writer(f).writerow(
                 [
@@ -493,6 +538,7 @@ class RunLevelEvalLogger:
                     _round(eval_episode_length),
                     self.activity,
                     self.strategy,
+                    eval_formula or "",
                 ]
             )
 
@@ -516,6 +562,7 @@ class RunLevelEvalLogger:
                 eval_reward=it_log.eval_reward,
                 eval_success_rate=getattr(it_log, "eval_success_rate", None),
                 eval_episode_length=getattr(it_log, "eval_episode_length", None),
+                eval_formula=getattr(it_log, "eval_formula", None),
             )
 
         return _cb

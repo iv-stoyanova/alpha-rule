@@ -151,38 +151,69 @@ def test_play_errors_without_trained_model():
 # play_top_k — iterative path-forbidding for k-rule selection.
 # --------------------------------------------------------------------- #
 
-def test_play_top_k_returns_distinct_first_actions():
-    """k distinct rules: each one starts from a different root action.
-    Forbidding cumulatively ensures branch-level diversity."""
+def test_play_top_k_returns_distinct_rules():
+    """Rule-level forbidding: every returned rule is distinct (each found rule
+    is forbidden as a whole, the dead-node mechanism), capped at k."""
+    import numpy as np
+
     from alpha_rule.training import play_top_k
 
     grammar, log = _train_tiny()
-    # Grammar has 2 event types (A, B) at root, so k=2 is the maximum.
     results = play_top_k(
         log,
         grammar=grammar,
         simulator=_ConstantSimulator(value=1.0),
-        k=2,
+        k=4, n_simulations=20, depth_limit=3,
+        rng=np.random.default_rng(0),
     )
-    assert len(results) == 2
     rules = [r for r, _ in results]
-    # First tokens of the rules must differ (different root branches).
-    first_tokens = {r.split()[0] for r in rules if r}
-    assert len(first_tokens) == 2
+    assert len(rules) == len(set(rules))       # all distinct
+    assert 1 <= len(rules) <= 4
 
 
-def test_play_top_k_stops_when_branches_exhausted():
-    """k larger than the number of root actions: returns at most that many."""
+def test_play_top_k_not_capped_at_root_branches():
+    """The fix: with only 2 root actions but a depth-3 search, play_top_k
+    returns MORE than 2 distinct rules — the old branch-forbidding capped it
+    at the number of root actions and got stuck. By pigeonhole some returned
+    rules then share a first token, which branch-forbidding could never do."""
+    import numpy as np
+
     from alpha_rule.training import play_top_k
 
-    grammar, log = _train_tiny()       # 2 root branches
+    grammar, log = _train_tiny()               # alphabet {A, B} -> 2 root actions
     results = play_top_k(
         log,
         grammar=grammar,
         simulator=_ConstantSimulator(value=1.0),
-        k=10,
+        k=4, n_simulations=20, depth_limit=3,
+        rng=np.random.default_rng(0),
     )
-    assert 1 <= len(results) <= 2      # never more than the available branches
+    rules = [r for r, _ in results if r]
+    assert len(rules) > 2                       # exceeded the 2-branch cap
+    first_tokens = [r.split()[0] for r in rules]
+    assert len(set(first_tokens)) < len(rules)  # some rules share a first token
+
+
+def test_play_respects_dead_rule_names():
+    """Forbidding a rule via dead_rule_names makes play() return a different
+    rule (the same dead-node mechanism MCTS uses for -inf rules), while leaving
+    its prefixes and siblings reachable."""
+    import numpy as np
+
+    from alpha_rule.training import play
+
+    grammar, log = _train_tiny()
+    rng = np.random.default_rng(0)
+    rule1, _ = play(
+        log, grammar=grammar, simulator=_ConstantSimulator(value=1.0),
+        n_simulations=20, depth_limit=3, rng=rng,
+    )
+    rule2, _ = play(
+        log, grammar=grammar, simulator=_ConstantSimulator(value=1.0),
+        n_simulations=20, depth_limit=3, rng=rng, dead_rule_names={rule1},
+    )
+    assert rule1 is not None and rule2 is not None
+    assert rule2 != rule1
 
 
 def test_play_top_k_sorted_by_reward_desc():

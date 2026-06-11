@@ -108,6 +108,13 @@ class IterationLog:
     """Fraction of eval episodes with total reward >= 1."""
     eval_episode_length: Optional[float] = None
     """Mean episode length (steps) across eval episodes."""
+    eval_formula: Optional[str] = None
+    """The rule the ``eval_*`` metrics above actually describe: the
+    ``play()`` result when ``eval_use_play=True``, otherwise
+    ``log.best_formula``. ``None`` on iterations where the eval didn't fire.
+    Logged next to the eval metrics so they are never read against the wrong
+    rule (under ``eval_use_play`` it differs from
+    ``best_formula_in_trajectory``)."""
 
     # --- Per-iteration phase timings (seconds) ---------------------- #
     t_mcts_s: float = 0.0
@@ -163,6 +170,13 @@ class TrainingLog:
     training (the simulator's ``reward_scale``, ``None`` if unknown). ``play()``
     reuses it to build a matching ``NeuralEvaluator`` so MCTS backup sees the
     network value in the same units as the simulator rewards."""
+    selection: Optional[SelectionStrategy] = None
+    """The exact ``SelectionStrategy`` training used (the resolved PUCT object).
+    ``play()`` defaults to it so a bare ``play(log, ...)`` reproduces the
+    training-time search instead of falling back to library defaults."""
+    backup: Optional[BackpropStrategy] = None
+    """The exact ``BackpropStrategy`` training used. ``play()`` defaults to it
+    for the same reason as ``selection``."""
 
 
 def _failed_count(traj: Trajectory) -> int:
@@ -242,10 +256,13 @@ def _unpack_eval_tuple(raw):
     value_attr = getattr(raw, "value", None)
     if value_attr is not None and not isinstance(raw, tuple):
         return float(value_attr), None, None
-    if isinstance(raw, tuple) and len(raw) >= 3:
-        return float(raw[0]), float(raw[1]), float(raw[2])
-    if isinstance(raw, tuple) and len(raw) >= 1:
-        return float(raw[0]), None, None
+    if isinstance(raw, tuple):
+        # Take whatever the tuple provides, leaving the rest ``None``; an empty
+        # tuple yields no reward (NaN -> blank in the logs) rather than crashing.
+        reward = float(raw[0]) if len(raw) >= 1 else float("nan")
+        success = float(raw[1]) if len(raw) >= 2 else None
+        steps = float(raw[2]) if len(raw) >= 3 else None
+        return reward, success, steps
     return float(raw), None, None
 
 
@@ -605,6 +622,8 @@ def train(
         n_simulations=n_simulations,
         depth_limit=depth_limit,
         value_scale=resolved_scale,
+        selection=sel,
+        backup=bp,
     )
     # Expose the in-training model immediately so ``play()`` can be called
     # from the eval hook (``eval_use_play=True``) while training is still
@@ -719,6 +738,7 @@ def train(
         #     eval, so combine with a larger ``eval_every`` in long runs.
         t_eval_s = 0.0
         eval_reward = eval_success = eval_steps = None
+        eval_formula: Optional[str] = None
         if eval_simulator is not None and it % max(1, eval_every) == 0:
             t0 = time.perf_counter()
             rule_to_eval: Optional[str] = None
@@ -731,6 +751,8 @@ def train(
                         temperature=0.0,
                         selection=sel,
                         backup=bp,
+                        n_chosen_evals=n_chosen_evals,
+                        dead_rule_names=dead_rules if dead_rules else None,
                     )
                     rule_to_eval = play_rule
                 except Exception:
@@ -740,6 +762,10 @@ def train(
                     rule_to_eval = log.best_formula
             else:
                 rule_to_eval = log.best_formula
+            # Record WHICH rule the eval_* metrics describe so they are never
+            # read against best_formula_in_trajectory (a different rule under
+            # eval_use_play).
+            eval_formula = rule_to_eval
             if rule_to_eval is not None:
                 raw = eval_simulator.evaluate(RuleStringNode(name=rule_to_eval))
                 eval_reward, eval_success, eval_steps = _unpack_eval_tuple(raw)
@@ -759,6 +785,7 @@ def train(
             eval_reward=eval_reward,
             eval_success_rate=eval_success,
             eval_episode_length=eval_steps,
+            eval_formula=eval_formula,
             t_mcts_s=t_mcts_s,
             t_nn_train_s=t_nn_train_s,
             t_eval_s=t_eval_s,
@@ -784,6 +811,8 @@ def play(
     depth_limit: Optional[int] = None,
     rng: Optional[np.random.Generator] = None,
     forbidden_root_actions: Optional[Iterable[str]] = None,
+    dead_rule_names: Optional[Iterable[str]] = None,
+    n_chosen_evals: int = 1,
     selection: Optional[SelectionStrategy] = None,
     backup: Optional[BackpropStrategy] = None,
 ) -> Tuple[Optional[str], float]:
@@ -820,14 +849,20 @@ def play(
         forbidden_root_actions: optional set of root-action names to
             block. ``run_self_play`` pre-expands the root and marks each
             forbidden child as ``is_dead=True`` so MCTS never visits it.
-            Used by ``play_top_k`` to enforce branch-level diversity.
-        selection: optional ``SelectionStrategy``. Pass the same
-            instance you used in ``train()`` to keep inference-time MCTS
-            consistent with training-time MCTS (most relevant when you
-            paired a non-default ``backup`` with a non-default
-            ``q_source`` at training time).
-        backup: optional ``BackpropStrategy``. Same consistency note as
-            ``selection``.
+        dead_rule_names: optional set of full rule names to treat as dead
+            (the same mechanism MCTS uses for ``-inf`` rules): any node whose
+            name is in the set is marked dead on expansion, so the search will
+            not commit to it but every prefix and sibling stays live. Used by
+            ``play_top_k`` for rule-level diversity.
+        n_chosen_evals: simulator samples averaged for each chosen-step
+            reward (default 1). Pass the training value to match the noise
+            handling used during training.
+        selection: optional ``SelectionStrategy``. Defaults to the one
+            ``train()`` used (``log.selection``), so a bare ``play(log, ...)``
+            reproduces the training-time search instead of falling back to
+            library defaults. Pass an explicit object to override.
+        backup: optional ``BackpropStrategy``. Defaults to ``log.backup``;
+            same rationale as ``selection``.
 
     Returns:
         ``(rule_name, reward)``. ``rule_name`` is ``None`` and
@@ -835,8 +870,6 @@ def play(
         at all (e.g., every root child was already dead).
     """
     import math
-
-    import torch
 
     from alpha_rule.evaluation.neural_evaluator import NeuralEvaluator
 
@@ -857,6 +890,12 @@ def play(
     depth = depth_limit if depth_limit is not None else (log.depth_limit or 5)
     rng = rng or np.random.default_rng()
 
+    # Default the search strategies to the exact ones training used (stored on
+    # the log) so a bare play(log, ...) reproduces training-time MCTS instead of
+    # silently falling back to library defaults; an explicit arg still wins.
+    sel = selection if selection is not None else log.selection
+    bp = backup if backup is not None else log.backup
+
     # Reuse the scale the training run resolved (stored on the log) so the
     # network value comes back in the simulator's reward units; fall back to the
     # simulator's own reward_scale, then to raw passthrough.
@@ -872,19 +911,22 @@ def play(
             model, grammar, simulator, max_len=log.max_len,
         )
 
-    with torch.no_grad():
-        traj = run_self_play(
-            grammar=grammar,
-            simulator=simulator,
-            network_evaluator=network_evaluator,
-            n_simulations=sims,
-            depth_limit=depth,
-            temperature=temperature,
-            selection=selection,
-            backup=backup,
-            rng=rng,
-            forbidden_root_actions=forbidden_root_actions,
-        )
+    # No torch.no_grad() needed: every network call goes through
+    # model.predict(), which already runs under torch.inference_mode().
+    traj = run_self_play(
+        grammar=grammar,
+        simulator=simulator,
+        network_evaluator=network_evaluator,
+        n_simulations=sims,
+        depth_limit=depth,
+        temperature=temperature,
+        selection=sel,
+        backup=bp,
+        rng=rng,
+        n_chosen_evals=n_chosen_evals,
+        forbidden_root_actions=forbidden_root_actions,
+        dead_rule_names=set(dead_rule_names) if dead_rule_names else None,
+    )
 
     if not traj.steps:
         return None, float("-inf")
@@ -921,31 +963,32 @@ def play_top_k(
     n_simulations: Optional[int] = None,
     depth_limit: Optional[int] = None,
     rng: Optional[np.random.Generator] = None,
+    n_chosen_evals: int = 1,
     selection: Optional[SelectionStrategy] = None,
     backup: Optional[BackpropStrategy] = None,
 ) -> List[Tuple[str, float]]:
     """
-    Iteratively call ``play()`` up to ``k`` times, each call forbidding
-    the first actions used by all previous calls. Returns the collected
-    ``(rule_name, reward)`` tuples sorted by reward descending.
+    Call ``play()`` up to ``k`` times, each call forbidding the exact rules
+    already found, and return the collected ``(rule_name, reward)`` tuples
+    sorted by reward descending.
 
-    Algorithm: branch-level diversity. After each successful ``play()``,
-    the first token of the returned rule (= the root action that was
-    taken first) is added to a forbidden set; the next call masks those
-    children at the search root. Stops early when ``play()`` returns no
-    rule (every remaining root branch is dead), so the result has at
-    most ``k`` entries and at most ``len(grammar.applicable_productions
-    (root))`` entries overall.
+    Diversity is rule-level: after each successful ``play()`` the full rule
+    string is added to a forbidden set passed back in as ``dead_rule_names``
+    (the same dead-node mechanism MCTS uses for ``-inf`` rules). The next
+    search marks that exact rule dead so it cannot be re-committed, while every
+    prefix and sibling stays live. This avoids the failure mode of forbidding
+    whole root branches: with a 2-letter alphabet scored by the count of ``A``
+    and depth 3, the top rule ``"A A A"`` would forbid the entire ``A`` branch
+    and the next rule ``"B A A"`` the ``B`` branch, leaving no live root action
+    by the third call. Forbidding the exact rule instead lets the second call
+    return ``"A A B"`` and so on.
 
-    This is a deliberately coarse diversity criterion: two different
-    rules sharing the same first token are not both returned, even if
-    their tails diverge. Future refinement: a Trie of forbidden full
-    paths so PUCT masks at the deepest matching prefix instead of only
-    the root.
+    Stops early when ``play()`` returns no rule (the reachable rule space is
+    exhausted), so the result has at most ``k`` entries.
     """
     if k <= 0:
         return []
-    forbidden: List[str] = []
+    found: set = set()
     results: List[Tuple[str, float]] = []
     for _ in range(k):
         rule, reward = play(
@@ -957,16 +1000,16 @@ def play_top_k(
             n_simulations=n_simulations,
             depth_limit=depth_limit,
             rng=rng,
-            forbidden_root_actions=tuple(forbidden) if forbidden else None,
+            dead_rule_names=found if found else None,
+            n_chosen_evals=n_chosen_evals,
             selection=selection,
             backup=backup,
         )
         if rule is None:
-            break                          # ran out of live root branches
+            break                          # reachable rule space exhausted
+        if rule in found:
+            break                          # defensive: play() repeated a forbidden rule
+        found.add(rule)
         results.append((rule, reward))
-        first_token = rule.split()[0] if rule.split() else None
-        if first_token is None or first_token in forbidden:
-            break                          # defensive: nothing new to forbid
-        forbidden.append(first_token)
     results.sort(key=lambda r: r[1], reverse=True)
     return results
