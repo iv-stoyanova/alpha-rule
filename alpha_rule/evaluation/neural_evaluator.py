@@ -65,6 +65,10 @@ class NeuralEvaluator(Evaluator):
                 f"value_scale must be > 0, got {value_scale!r}"
             )
         self.model = model
+        # Inference wrapper: keep the net in eval mode so per-node predict()
+        # calls skip the recursive train/eval toggle. train_step() flips to
+        # train for the gradient step and restores eval afterwards.
+        self.model.eval()
         self.grammar = grammar
         self.max_len = max_len
         self.value_scale = float(value_scale)

@@ -185,6 +185,10 @@ def train_step(
     if grad_clip and grad_clip > 0:
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(grad_clip))
     optimizer.step()
+    # Restore eval mode: the gradient step is the only place the net needs
+    # train mode. Leaving it in eval means search-time predict() calls skip the
+    # recursive train/eval toggle on every scored node (a measured hot path).
+    model.eval()
     return TrainStepLog(
         total=float(total.detach().item()),
         policy=float(policy_loss.detach().item()),

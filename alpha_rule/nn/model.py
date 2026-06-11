@@ -72,11 +72,19 @@ class AllenFormulaNet(nn.Module):
         """Gradient-free inference forward (eval mode, no autograd) for scoring
         nodes during search -- the search never needs gradients, and this
         avoids building the autograd graph on the per-node hot path. Restores
-        the prior train/eval mode on return."""
+        the prior train/eval mode on return.
+
+        The eval/train switch is skipped when the model is already in eval
+        mode. ``nn.Module.eval()`` and ``.train()`` each recursively walk every
+        submodule; on the per-node search hot path that toggle costs more than
+        the forward itself. Keeping the net in eval outside the gradient step
+        (``train_step`` flips to train, then restores eval) makes this a no-op."""
         was_training = self.training
-        self.eval()
+        if was_training:
+            self.eval()
         try:
             with torch.inference_mode():
                 return self.forward(x)
         finally:
-            self.train(was_training)
+            if was_training:
+                self.train(True)
