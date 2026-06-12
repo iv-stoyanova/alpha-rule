@@ -19,13 +19,19 @@ __all__ = [
     "RuleStringNode",
     "NeuralEvaluator",
     "DEFAULT_VALUE_SCALE",
+    "RuleSimulator",
 ]
 
 
 def __getattr__(name: str):
-    """Lazily resolve the concrete neural evaluator (keeps the eager import of
-    this package from pulling in ``grammar`` / ``mcts`` and torch)."""
+    """Lazily resolve the optional concrete evaluators so importing this package
+    stays light: ``NeuralEvaluator`` pulls in ``grammar`` / ``mcts`` and torch,
+    and ``RuleSimulator`` pulls in ``gymnasium``. Neither is imported until it is
+    actually referenced."""
     if name in {"NeuralEvaluator", "DEFAULT_VALUE_SCALE"}:
         from alpha_rule.evaluation import neural_evaluator
         return getattr(neural_evaluator, name)
+    if name == "RuleSimulator":
+        from alpha_rule.evaluation import rule_simulator
+        return rule_simulator.RuleSimulator
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
