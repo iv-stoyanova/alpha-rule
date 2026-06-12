@@ -202,8 +202,8 @@ class HistoryToRuleWrapperBase(gym.ObservationWrapper):
         event = event_obj_from_obs(obs, self.all_event_types)
         self._append_event_to_matrix(event)
         self._events.append(event)
-        # Trim semantics: pop while the buffer is >= window.
-        while len(self._events) >= self.window:
+        # Trim down to exactly ``window`` events.
+        while len(self._events) > self.window:
             self._events.popleft()
             self._trim_oldest_from_matrix()
 
@@ -218,4 +218,6 @@ class HistoryToRuleWrapperBase(gym.ObservationWrapper):
     def reset(self, **kwargs):
         self._events = deque()
         self._history_matrix = None
-        return super().reset()[0]
+        # Forward seed/options and return the standard gym ``(obs, info)``
+        # 2-tuple. ``ObservationWrapper.reset`` already applies ``observation()``.
+        return super().reset(**kwargs)

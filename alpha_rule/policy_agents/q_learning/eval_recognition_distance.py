@@ -49,6 +49,10 @@ def q_learning_agent_eval_recognition_distance(
     q_table, policy = agent
     distances = []
 
+    # Resolve the wrapper-chain accessor once for both get_state_tuple and the
+    # per-step activity check.
+    get_otc = find_attr_in_wrappers(env, "get_otc")
+
     for _ in range(n_eval_episodes):
         context_obs = env.reset()
         if isinstance(context_obs, tuple):
@@ -59,7 +63,7 @@ def q_learning_agent_eval_recognition_distance(
         activity_step = None
 
         while not (done or truncated):
-            full_state = get_state_tuple(env, context_obs)
+            full_state = get_state_tuple(env, context_obs, get_otc=get_otc)
             action = policy(full_state)
 
             # Recognition check (pre-step): does the candidate rule fire?
@@ -85,7 +89,7 @@ def q_learning_agent_eval_recognition_distance(
 
             # Post-step activity check: did the target box open this step?
             if activity_step is None:
-                otc_env = find_attr_in_wrappers(env, "get_otc")()
+                otc_env = get_otc()
                 box_obs = otc_env.get_observations()["open"]
                 # box_ground_truth = [box.is_ready() for box in otc_env.boxes]
                 if box_obs[box_index]:

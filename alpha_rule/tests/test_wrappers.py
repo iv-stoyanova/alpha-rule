@@ -66,8 +66,8 @@ def test_rolling_window_trims(fake_gym_env):
     # Emit more events than window; past events must be trimmed.
     for obs in _canned_events() * 3:
         wrapped.observation(obs)
-    # The wrapper pops while ``len >= window``, so the list holds at most window-1.
-    assert len(wrapped.passed_events_list) < wrapped.window
+    # The wrapper pops while ``len > window``, so it retains exactly ``window``.
+    assert len(wrapped.passed_events_list) == wrapped.window
 
 
 # --------------------------------------------------------------------------- #
@@ -104,6 +104,17 @@ def test_reset_clears_history(fake_gym_env):
     wrapped.reset()
     # After reset: the initial observation gets appended (at most 1 event).
     assert len(wrapped.passed_events_list) <= 1
+
+
+def test_reset_returns_standard_obs_info_tuple(fake_gym_env):
+    """reset() conforms to the gym contract: a 2-tuple (obs, info)."""
+    env = fake_gym_env(events=_canned_events(), event_types=("A", "B"))
+    wrapped = HistoryToRuleWrapperBase(env, rule_list=["A"])
+    out = wrapped.reset()
+    assert isinstance(out, tuple) and len(out) == 2
+    obs, info = out
+    assert len(obs) == 1                 # one rule indicator
+    assert isinstance(info, dict)
 
 
 # --------------------------------------------------------------------------- #

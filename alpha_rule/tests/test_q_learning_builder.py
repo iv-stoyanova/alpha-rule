@@ -29,6 +29,9 @@ class _Discrete:
     def sample(self):
         return int(self._rng.integers(self.n))
 
+    def seed(self, s):
+        self._rng = np.random.default_rng(s)
+
 
 class _MiniOTC:
     """Stand-in for the OTC env exposing ``get_observations``."""
@@ -164,6 +167,50 @@ def test_q_learning_respects_total_timesteps_cap_even_with_changing_q():
         assert env.steps == 400, (
             f"expected full 400 steps under non-converging Q; got {env.steps}"
         )
+    finally:
+        _restore_discrete(orig)
+
+
+def test_terminal_transitions_do_not_bootstrap():
+    """On a terminal step the TD target is the reward alone (no gamma*max(next)).
+    With episode_len=1 every step is terminal and the env is single-state, so Q
+    must converge to the reward (~1.0), not the bootstrapped reward/(1-gamma)
+    (~20)."""
+    if not _HAS_GYM:
+        return
+    orig = _patch_discrete_isinstance()
+    try:
+        from alpha_rule.policy_agents.q_learning.builder import q_learning_agent_builder
+
+        env = _StepCountingEnv(reward=1.0, episode_len=1)      # every step terminal
+        q_table, _policy = q_learning_agent_builder(
+            env, total_timesteps=3000, epsilon=0.2,
+        )
+        max_q = max(float(np.max(arr)) for arr in q_table.values())
+        assert max_q < 2.0, f"terminal Q bootstrapped too high ({max_q:.2f}); should be ~1.0"
+        assert max_q > 0.5, f"terminal Q did not learn the reward ({max_q:.2f})"
+    finally:
+        _restore_discrete(orig)
+
+
+def test_seed_makes_training_reproducible():
+    """Same seed -> identical Q-table (ε draws use a seeded local RNG and the
+    action space is seeded)."""
+    if not _HAS_GYM:
+        return
+    orig = _patch_discrete_isinstance()
+    try:
+        from alpha_rule.policy_agents.q_learning.builder import q_learning_agent_builder
+
+        def _build():
+            env = _StepCountingEnv(reward=1.0, episode_len=5)
+            qt, _ = q_learning_agent_builder(env, total_timesteps=500, epsilon=0.3, seed=42)
+            return qt
+
+        a, b = _build(), _build()
+        assert a.keys() == b.keys()
+        for k in a:
+            assert np.allclose(a[k], b[k]), f"state {k} diverged across seeded runs"
     finally:
         _restore_discrete(orig)
 

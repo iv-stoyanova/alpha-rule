@@ -49,6 +49,7 @@ def q_learning_agent_builder(
         early_stop_tol=0.0,
         check_interval=200,
         patience=3,
+        seed=None,
 ):
     """
     Build and train a tabular Q-learning agent.
@@ -72,6 +73,9 @@ def q_learning_agent_builder(
             ``early_stop_tol == 0``.
         patience: number of consecutive sub-tolerance checks required to
             exit. Ignored when ``early_stop_tol == 0``.
+        seed: if given, makes training reproducible: ε-greedy draws use a
+            local ``np.random.Generator(seed)`` and the action space is seeded
+            for ``sample()``. ``None`` uses the global ``np.random``.
 
     Returns:
         ``(q_table, policy)`` where ``policy(full_state)`` returns an int
@@ -81,6 +85,11 @@ def q_learning_agent_builder(
 
     n_actions = env.action_space.n
     q_table: dict = {}
+
+    # Local RNG when seeded, else the global np.random. Both expose .random().
+    rng = np.random.default_rng(seed) if seed is not None else np.random
+    if seed is not None:
+        env.action_space.seed(seed)
 
     # Resolve the wrapper-chain accessor once. ``find_attr_in_wrappers``
     # walks ``.env`` recursively, which is wasted work to repeat every step.
@@ -97,7 +106,7 @@ def q_learning_agent_builder(
         state = get_state_tuple(env, context_obs, get_otc=get_otc)
         state_q = _q_table_get(q_table, state, n_actions)
 
-        if np.random.rand() < epsilon:
+        if rng.random() < epsilon:
             action = env.action_space.sample()
         else:
             action = int(np.argmax(state_q))
@@ -105,11 +114,18 @@ def q_learning_agent_builder(
         next_obs, reward, done, truncated, *_ = env.step(action)
         if isinstance(next_obs, tuple):
             next_obs = next_obs[0]
-        next_state = get_state_tuple(env, next_obs, get_otc=get_otc)
-        next_state_q = _q_table_get(q_table, next_state, n_actions)
 
-        best_next = np.max(next_state_q)
-        state_q[action] += alpha * (reward + gamma * best_next - state_q[action])
+        # TD target: bootstrap gamma*max(next) only on non-terminal transitions.
+        # A terminal step has no successor, so its target is the reward alone.
+        # Truncation is treated the same way, since the state carries no time
+        # feature.
+        if done or truncated:
+            td_target = reward
+        else:
+            next_state = get_state_tuple(env, next_obs, get_otc=get_otc)
+            next_state_q = _q_table_get(q_table, next_state, n_actions)
+            td_target = reward + gamma * np.max(next_state_q)
+        state_q[action] += alpha * (td_target - state_q[action])
 
         if not (done or truncated):
             context_obs = next_obs

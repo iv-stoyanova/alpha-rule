@@ -8,7 +8,8 @@ target chest (``otc_env.get_observations()["open"]``), this evaluator reads
 simulator that flips True whenever the activity's precondition is satisfied,
 regardless of what the agent does. This avoids the ``-inf`` failure mode where
 a correctly-firing rule scores poorly just because Q-learning didn't converge
-to a working open-chest policy in 5,000 training steps.
+to a working open-chest policy within the (short) per-leaf training budget
+(``q_learning_agent_builder`` defaults to 1,000 steps).
 
 Pairing strategy (asymmetric per-activity):
     - Collect every rising edge (0 to 1) of the gated rule-fire indicator and
@@ -71,6 +72,10 @@ def q_learning_agent_eval_ground_truth_distance(
     q_table, policy = agent
     distances = []
 
+    # Resolve the wrapper-chain accessor once for both get_state_tuple and the
+    # per-step is_ready() check.
+    get_otc = find_attr_in_wrappers(env, "get_otc")
+
     for _ in range(n_eval_episodes):
         context_obs = env.reset()
         if isinstance(context_obs, tuple):
@@ -83,7 +88,7 @@ def q_learning_agent_eval_ground_truth_distance(
         prev_ready = False
 
         while not (done or truncated):
-            full_state = get_state_tuple(env, context_obs)
+            full_state = get_state_tuple(env, context_obs, get_otc=get_otc)
             action = policy(full_state)
 
             # Gated rule-fire check: candidate is the LAST element of
@@ -107,7 +112,7 @@ def q_learning_agent_eval_ground_truth_distance(
 
             # Post-step activity check using the ground-truth readiness flag
             # (policy-independent, unlike ``get_observations()["open"]``).
-            otc_env = find_attr_in_wrappers(env, "get_otc")()
+            otc_env = get_otc()
             ready_now = bool(otc_env.boxes[box_index].is_ready())
             if ready_now and not prev_ready:
                 activity_events.append(step)

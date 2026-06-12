@@ -158,3 +158,125 @@ def test_rule_simulator_strips_end_marker():
         assert "<END>" not in seen_rules[0]
     finally:
         restore()
+
+
+def test_rule_simulator_explicit_reward_scale_wins():
+    """An explicit reward_scale is stored verbatim (no auto-derivation)."""
+    from alpha_rule.evaluation import rule_simulator as rs
+
+    restore = _patch_gym_make(rs, lambda n: _SentinelEnv())
+    try:
+        sim = rs.RuleSimulator(
+            "fake-v0", lambda e: None,
+            lambda env, r: _SentinelWrapper(env, r), lambda a, e: 0.0,
+            reward_scale=51.0,
+        )
+        assert sim.reward_scale == 51.0
+        assert sim._env is None             # explicit value never builds the env
+    finally:
+        restore()
+
+
+class _BoxEnv(_SentinelEnv):
+    """Sentinel env that also exposes ``get_otc().boxes`` (num_boxes source)."""
+    def __init__(self, n_boxes=3):
+        super().__init__()
+        self._otc = type("OTC", (), {"boxes": [0] * n_boxes})()
+
+    def reset(self, seed=None):
+        self.resets += 1
+        return None
+
+    def get_otc(self):
+        return self._otc
+
+
+def test_rule_simulator_auto_derives_reward_scale_from_num_boxes():
+    """With no explicit reward_scale, it is derived from the env's box count
+    (num_boxes is the positive reward cap)."""
+    from alpha_rule.evaluation import rule_simulator as rs
+
+    restore = _patch_gym_make(rs, lambda n: _BoxEnv(n_boxes=3))
+    try:
+        sim = rs.RuleSimulator(
+            "fake-v0", lambda e: None,
+            lambda env, r: _SentinelWrapper(env, r), lambda a, e: 0.0,
+        )
+        assert sim.reward_scale == 3.0          # == num_boxes
+    finally:
+        restore()
+
+
+def test_rule_simulator_forwards_agent_builder_kwargs():
+    """agent_builder_kwargs reach the builder on every evaluate (tunable
+    per-leaf training budget)."""
+    from alpha_rule.evaluation import rule_simulator as rs
+
+    restore = _patch_gym_make(rs, lambda n: _SentinelEnv())
+    try:
+        seen = {}
+
+        def builder(wrapped, **kwargs):
+            seen.update(kwargs)
+            return None
+
+        sim = rs.RuleSimulator(
+            "fake-v0", builder,
+            lambda env, r: _SentinelWrapper(env, r), lambda a, e: 0.0,
+            reward_scale=1.0,
+            agent_builder_kwargs={"total_timesteps": 7, "early_stop_tol": 1e-3},
+        )
+        sim.evaluate(_FakeNode(name="A"))
+        assert seen == {"total_timesteps": 7, "early_stop_tol": 1e-3}
+    finally:
+        restore()
+
+
+def test_rule_simulator_warns_once_when_reward_scale_absent():
+    """A missing reward_scale (silent value_scale=1.0) raises one warning, not
+    one per evaluate."""
+    import warnings
+
+    from alpha_rule.evaluation import rule_simulator as rs
+
+    restore = _patch_gym_make(rs, lambda n: _SentinelEnv())
+    try:
+        sim = rs.RuleSimulator(
+            "fake-v0", lambda e: None,
+            lambda env, r: _SentinelWrapper(env, r), lambda a, e: 0.0,
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            sim.evaluate(_FakeNode(name="A"))
+            sim.evaluate(_FakeNode(name="A < B"))
+        assert sum("reward_scale" in str(w.message) for w in caught) == 1
+    finally:
+        restore()
+
+
+def test_rule_simulator_seed_reseeds_env_each_evaluate():
+    """With seed set, the base env is reset(seed=...) at the start of evaluate
+    so the rule scores reproducibly."""
+    from alpha_rule.evaluation import rule_simulator as rs
+
+    class _SeedRecordingEnv(_SentinelEnv):
+        def __init__(self):
+            super().__init__()
+            self.seeds = []
+
+        def reset(self, seed=None):
+            self.seeds.append(seed)
+            return None
+
+    restore = _patch_gym_make(rs, lambda n: _SeedRecordingEnv())
+    try:
+        sim = rs.RuleSimulator(
+            "fake-v0", lambda e: None,
+            lambda env, r: _SentinelWrapper(env, r), lambda a, e: 0.0,
+            reward_scale=1.0, seed=123,
+        )
+        sim.evaluate(_FakeNode(name="A"))
+        sim.evaluate(_FakeNode(name="A < B"))
+        assert sim._env.seeds == [123, 123]
+    finally:
+        restore()
