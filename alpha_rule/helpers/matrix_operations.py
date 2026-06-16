@@ -86,8 +86,14 @@ def check_rows_columns_combined(matrix, values_to_remove=['#', '=']):
     :param values_to_remove: The list of values to check for (default is ['#', '='])
     :return: A single list of 0s and 1s indicating rows/columns to keep or remove.
     """
-    # Create a mask that checks if each element in the matrix is in values_to_remove
-    mask = np.isin(matrix, values_to_remove)
+    # Mask of cells whose value is in ``values_to_remove``. Elementwise OR over
+    # the (small, fixed) remove-set instead of ``np.isin``: np.isin has no typed
+    # fast path for object-dtype arrays and falls back to a slow generic
+    # per-element path, while ``matrix == value`` is a direct vectorized
+    # comparison. The result is identical for any value list.
+    mask = np.zeros(matrix.shape, dtype=bool)
+    for value in values_to_remove:
+        mask |= (matrix == value)
 
     # Check for rows: np.all checks if all elements in each row are in the values_to_remove
     rows_check = np.all(mask[1:, :], axis=1)

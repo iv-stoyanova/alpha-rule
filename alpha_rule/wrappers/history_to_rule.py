@@ -22,7 +22,6 @@ import numpy as np
 from gymnasium import spaces
 
 from alpha_rule.helpers.generic import event_obj_from_obs
-from alpha_rule.helpers.matrix_operations import check_rows_columns_combined
 from alpha_rule.rules.allen_matrix import AllenMatrix
 from alpha_rule.rules.rule_matching import (
     determine_allen_relation,
@@ -145,11 +144,21 @@ class HistoryToRuleWrapperBase(gym.ObservationWrapper):
         """Update ``self._history_matrix`` in-place to include ``new_event``
         at column 0 (the newest-event column). O(n_old) Allen-relation
         computations vs O(n²) for a full rebuild."""
+        # Invariant behind the all-ones indicator shortcut used below: event
+        # types are never the matrix fillers '#'/'='. If that ever changes the
+        # shortcut would write a wrong indicator row, so guard it cheaply.
+        assert new_event.type not in ("#", "="), (
+            f"history event type {new_event.type!r} collides with a matrix "
+            "filler; the all-ones indicator shortcut is invalid"
+        )
         if self._history_matrix is None or self._history_matrix.shape[1] == 0:
             m = np.full((3, 1), "#", dtype=object)
             m[1, 0] = new_event.type
             m[2, 0] = "="
-            m[0] = check_rows_columns_combined(m[1:]).astype(int)
+            # Indicator is always all-ones (a real event type in row 1 means the
+            # single column is never removable), so skip the per-step
+            # check_rows_columns_combined (np.isin over an object array).
+            m[0] = np.ones(1, dtype=int)
             self._history_matrix = m
             return
 
@@ -179,7 +188,9 @@ class HistoryToRuleWrapperBase(gym.ObservationWrapper):
         for i in range(n_new):
             new[i + 2, i] = "="
 
-        new[0] = check_rows_columns_combined(new[1:]).astype(int)
+        # Always all-ones under the real-type invariant (see the assert above),
+        # so skip the object-array check_rows_columns_combined recompute.
+        new[0] = np.ones(n_new, dtype=int)
         self._history_matrix = new
 
     def _trim_oldest_from_matrix(self):
@@ -191,7 +202,9 @@ class HistoryToRuleWrapperBase(gym.ObservationWrapper):
             self._history_matrix = None
             return
         trimmed = self._history_matrix[:n + 1, :n - 1].copy()
-        trimmed[0] = check_rows_columns_combined(trimmed[1:]).astype(int)
+        # Dropping the oldest column leaves real types in row 1, so the
+        # indicator stays all-ones; no recompute needed.
+        trimmed[0] = np.ones(n - 1, dtype=int)
         self._history_matrix = trimmed
 
     # ------------------------------------------------------------------ #
