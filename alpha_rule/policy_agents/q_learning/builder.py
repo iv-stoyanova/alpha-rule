@@ -44,7 +44,7 @@ def q_learning_agent_builder(
         env,
         total_timesteps=1_000,
         alpha=0.1,
-        gamma=0.95,
+        gamma=0.97,
         epsilon=0.1,
         early_stop_tol=0.0,
         check_interval=200,
@@ -83,6 +83,9 @@ def q_learning_agent_builder(
     """
     assert isinstance(env.action_space, gym.spaces.Discrete), "Only discrete actions supported"
 
+    # Action set is taken from the env's action space. Wrap the env in
+    # ``OneHotBoxActionWrapper`` upstream to get the "open one box or none"
+    # space (size n_boxes + 1); without it this is the raw button mask.
     n_actions = env.action_space.n
     q_table: dict = {}
 
@@ -111,7 +114,15 @@ def q_learning_agent_builder(
         else:
             action = int(np.argmax(state_q))
 
+        # Step with the agent's action directly; any one-hot/box remapping is
+        # owned by an upstream action wrapper (OneHotBoxActionWrapper), not by
+        # this builder, so the same action is interpreted identically in
+        # training and evaluation.
         next_obs, reward, done, truncated, *_ = env.step(action)
+        # Open-chest bonus: amplify the positive reward so the agent is strongly
+        # motivated to open a box rather than play it safe.
+        if reward > 0:
+            reward += 10
         if isinstance(next_obs, tuple):
             next_obs = next_obs[0]
 
@@ -119,6 +130,13 @@ def q_learning_agent_builder(
         # A terminal step has no successor, so its target is the reward alone.
         # Truncation is treated the same way, since the state carries no time
         # feature.
+        # print(f"reward: {reward} ")
+        if done:
+            # print("all chest open")
+            pass
+        if truncated:
+            # print("truncated")
+            pass
         if done or truncated:
             td_target = reward
         else:
@@ -162,4 +180,7 @@ def q_learning_agent_builder(
             return 0
         return int(np.argmax(arr))
 
+    # print(policy)
+    # print(q_table)
+    # print("a"+5)
     return q_table, policy
