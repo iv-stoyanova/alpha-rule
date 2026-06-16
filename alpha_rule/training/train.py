@@ -170,6 +170,11 @@ class TrainingLog:
     training (the simulator's ``reward_scale``, ``None`` if unknown). ``play()``
     reuses it to build a matching ``NeuralEvaluator`` so MCTS backup sees the
     network value in the same units as the simulator rewards."""
+    neg_value_scale: Optional[float] = None
+    """Negative reward cap used for asymmetric value scaling during training.
+    ``None`` means it mirrored ``value_scale`` (symmetric). ``play()`` reuses it
+    so its ``NeuralEvaluator`` de-scales the value head exactly as training
+    did."""
     selection: Optional[SelectionStrategy] = None
     """The exact ``SelectionStrategy`` training used (the resolved PUCT object).
     ``play()`` defaults to it so a bare ``play(log, ...)`` reproduces the
@@ -364,6 +369,7 @@ def train(
     buffer_warmup: int = 16,
     batch_size: int = 16,
     value_scale: Optional[float] = None,
+    neg_value_scale: Optional[float] = None,
     # --- network (AllenFormulaNet) --------------------------------- #
     d_model: int = 64,
     nhead: int = 4,
@@ -382,6 +388,7 @@ def train(
     c_puct: float = 1.5,
     fpu_reduction: float = 0.25,
     q_source: str = "max",
+    fpu_baseline: float = float("-inf"),
     selection: Optional[SelectionStrategy] = None,
     # --- backpropagation ------------------------------------------- #
     backup: str | BackpropStrategy = "max",
@@ -399,6 +406,8 @@ def train(
     on_iteration_end=None,
     device: Optional[str] = None,
     seed: int = 0,
+    debug: int = 0,
+    debug_every: int = 1,
 ) -> TrainingLog:
     """
     Run ``n_iterations`` self-play + train iterations.
@@ -441,6 +450,21 @@ def train(
             ``iteration % eval_every == 0`` (default 5). Ignored when
             ``eval_simulator is None``.
         on_iteration_end: optional callback ``fn(log: IterationLog)``.
+        debug: verbosity of the live training trace (default 0, off). ``1``
+            prints a one-line summary per iteration (trajectory length, the
+            best step and running-best formula with rewards, the three losses,
+            dead-rule count, buffer fill, and the eval metrics on eval
+            iterations) plus the self-play path of every episode. ``2`` also
+            prints the full PUCT option table at every construction step. ``3``
+            also traces every MCTS simulation (round header, per-selection PUCT
+            scores and pick, expansions, per-leaf eval mode + value, dead /
+            forbidden marking); very verbose (see ``run_self_play``'s ``debug``).
+            Purely observational.
+        debug_every: when ``debug >= 2``, restrict the expensive per-step PUCT
+            tables to iterations where ``iteration % debug_every == 0`` (default
+            1, every iteration). The per-iteration summary and the self-play
+            path still print every iteration; only the verbose tables are
+            thinned. Ignored when ``debug < 2``.
         device: torch device for the policy-value network, e.g.
             ``"cuda"``, ``"cuda:0"``, ``"cpu"``. Defaults to ``"cuda"``
             when ``torch.cuda.is_available()`` else ``"cpu"``. The
@@ -466,6 +490,14 @@ def train(
             network's value back to reward units in the ``NeuralEvaluator``.
             ``None`` (default) reads the cap from the simulator's
             ``reward_scale`` if it has one, else falls back to ``1.0``.
+        neg_value_scale: negative reward cap for ASYMMETRIC value scaling.
+            ``None`` (default) mirrors ``value_scale`` (symmetric, historical
+            behaviour). Set it larger than ``value_scale`` when the positive cap
+            is small (e.g. ``value_scale=3`` for 3 boxes) but the penalty tail
+            runs much more negative: good rules then keep full resolution in
+            ``[0, 1]`` while bad rules spread across ``[-1, 0)`` instead of all
+            saturating at ``-1``. Threaded identically into the replay buffer,
+            the ``NeuralEvaluator`` de-scaling, and the stored ``TrainingLog``.
         leaf_eval_mode: ``"nn"`` (default, AlphaZero leaf bootstrap)
             uses the network's value head at non-terminal leaves and
             the simulator only at terminal leaves; ``"simulator"`` uses
@@ -522,6 +554,12 @@ def train(
             near 1; if your ``reward_scale`` is larger (say 4), scale
             ``c_puct`` up roughly in proportion or the search collapses to
             pure exploitation.
+        fpu_baseline: lower bound on the first-play-urgency value an UNVISITED
+            child can receive when building the default ``PUCTSelection``
+            (ignored when an explicit ``selection`` is passed). Default
+            ``-inf`` is a no-op; a finite value (e.g. ``0.0``) stops a parent
+            dragged very negative by bad sibling backups from suppressing
+            exploration of fresh actions.
         percentile, min_samples: ``PercentileRewardBackup`` knobs, used
             only when ``backup="percentile"``.
 
@@ -574,19 +612,27 @@ def train(
     if value_scale is not None:
         network_evaluator = NeuralEvaluator(
             model, grammar, max_len=max_len, value_scale=value_scale,
+            neg_value_scale=neg_value_scale,
         )
     else:
         network_evaluator = NeuralEvaluator.from_simulator(
             model, grammar, expensive_simulator, max_len=max_len,
+            neg_value_scale=neg_value_scale,
         )
     resolved_scale = network_evaluator.value_scale
-    buffer = ReplayBuffer(capacity=buffer_capacity, value_scale=resolved_scale)
+    resolved_neg_scale = network_evaluator.neg_value_scale
+    buffer = ReplayBuffer(
+        capacity=buffer_capacity,
+        value_scale=resolved_scale,
+        neg_value_scale=resolved_neg_scale,
+    )
 
     # Resolve the search strategies once. ``selection``/``backup`` accept an
     # explicit object (advanced override, takes precedence); otherwise they
     # are built from the scalar kwargs so every knob is visible at this call.
     sel = selection if selection is not None else PUCTSelection(
         c_puct=c_puct, fpu_reduction=fpu_reduction, q_source=q_source,
+        fpu_baseline=fpu_baseline,
     )
     if isinstance(backup, str):
         if backup == "max":
@@ -622,6 +668,7 @@ def train(
         n_simulations=n_simulations,
         depth_limit=depth_limit,
         value_scale=resolved_scale,
+        neg_value_scale=resolved_neg_scale,
         selection=sel,
         backup=bp,
     )
@@ -651,6 +698,15 @@ def train(
             temp_it = temperature + (temperature_final - temperature) * frac
 
         # --- MCTS / self-play -------------------------------------- #
+        # Resolve this iteration's self-play debug level: paths + chosen-node
+        # lines (level 1) print every iteration when debug is on; the verbose
+        # per-step PUCT tables (level 2) are thinned to every ``debug_every``.
+        if not debug:
+            sp_debug = 0
+        elif it % max(1, debug_every) == 0:
+            sp_debug = debug
+        else:
+            sp_debug = min(debug, 1)
         t0 = time.perf_counter()
         traj = run_self_play(
             grammar=grammar,
@@ -667,7 +723,10 @@ def train(
             dirichlet_alpha=dirichlet_alpha,
             leaf_eval_mode=leaf_eval_mode,
             value_scale=resolved_scale,
+            neg_value_scale=resolved_neg_scale,
             dead_rule_names=dead_rules if dead_rules else None,
+            debug=sp_debug,
+            debug_tag=f"it={it}",
         )
         t_mcts_s = time.perf_counter() - t0
 
@@ -678,8 +737,13 @@ def train(
         n_failed = _failed_count(traj)
 
         # Accumulate -inf rules seen in this episode into the persistent
-        # set so future iterations can short-circuit them.
+        # set so future iterations can short-circuit them: both the committed
+        # steps that scored -inf (``_collect_dead_rules``) and the rule nodes
+        # killed mid-search because their ``<END>`` never fired
+        # (``traj.dead_names``, which are no longer committed so the former would
+        # miss them).
         dead_rules.update(_collect_dead_rules(traj))
+        dead_rules.update(traj.dead_names)
 
         # --- Replay buffer push ------------------------------------ #
         t0 = time.perf_counter()
@@ -792,6 +856,34 @@ def train(
             t_buffer_s=t_buffer_s,
         )
         log.iterations.append(it_log)
+
+        # One-line live trace per iteration (off unless debug). Sits next to
+        # the self-play path that run_self_play already printed for this
+        # episode, so the run reads top-to-bottom as "what got searched" then
+        # "where the run stands".
+        if debug:
+            br = it_log.best_reward_in_trajectory
+            brtxt = f"{br:.2f}" if math.isfinite(br) else "-inf"
+            rbtxt = f"{log.best_reward:.2f}" if math.isfinite(log.best_reward) else "-inf"
+            line = (
+                f"[it={it}] len={it_log.trajectory_length} "
+                f"best_step={it_log.best_formula_in_trajectory!r} ({brtxt}) | "
+                f"running_best={log.best_formula!r} ({rbtxt}) | "
+                f"loss tot={it_log.train_total:.3f} pol={it_log.train_policy:.3f} "
+                f"val={it_log.train_value:.3f} | dead={it_log.n_dead_rules} "
+                f"buf={it_log.buffer_fill_fraction:.2f}"
+            )
+            if it_log.eval_reward is not None:
+                stxt = (
+                    f"{it_log.eval_success_rate:.2f}"
+                    if it_log.eval_success_rate is not None else "n/a"
+                )
+                line += (
+                    f" | EVAL {it_log.eval_formula!r} "
+                    f"r={it_log.eval_reward:.2f} succ={stxt}"
+                )
+            print(line)
+
         if on_iteration_end is not None:
             on_iteration_end(it_log)
 
@@ -902,13 +994,16 @@ def play(
     scale = log.value_scale if log.value_scale is not None else getattr(
         simulator, "reward_scale", None
     )
+    neg_scale = log.neg_value_scale     # None -> NeuralEvaluator mirrors `scale`
     if scale is not None:
         network_evaluator = NeuralEvaluator(
             model, grammar, max_len=log.max_len, value_scale=scale,
+            neg_value_scale=neg_scale,
         )
     else:
         network_evaluator = NeuralEvaluator.from_simulator(
             model, grammar, simulator, max_len=log.max_len,
+            neg_value_scale=neg_scale,
         )
 
     # No torch.no_grad() needed: every network call goes through

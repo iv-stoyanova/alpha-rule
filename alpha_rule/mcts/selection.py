@@ -47,6 +47,7 @@ class PUCTSelection(SelectionStrategy):
         c_puct: float = 1.5,
         fpu_reduction: float = 0.25,
         q_source: str = "max",
+        fpu_baseline: float = float("-inf"),
     ):
         if fpu_reduction < 0.0:
             raise ValueError(
@@ -60,6 +61,13 @@ class PUCTSelection(SelectionStrategy):
         self.c_puct = c_puct
         self.fpu_reduction = fpu_reduction
         self.q_source = q_source
+        # Lower bound on the first-play-urgency value for UNVISITED children.
+        # Default ``-inf`` is a no-op (historical behaviour). A finite value
+        # (e.g. 0) stops a parent dragged very negative by bad sibling backups
+        # from suppressing exploration: an unexplored child is never scored
+        # below this baseline, so fresh actions stay competitive with already-
+        # explored mediocre ones.
+        self.fpu_baseline = fpu_baseline
 
     def _extract_q(self, node) -> Optional[float]:
         """Return the node's Q under the configured ``q_source``, or ``None``
@@ -78,14 +86,21 @@ class PUCTSelection(SelectionStrategy):
         if child.is_dead:
             return float("-inf")
         sum_n = max(1, sum(c.N for c in parent.children))
+        u = self.c_puct * child.prior * math.sqrt(sum_n) / (1 + child.N)
         q = self._extract_q(child) if child.N > 0 else None
         if q is None:
-            # KataGo-style FPU: estimate the unvisited child's value at
-            # the parent's known Q, reduced by how much prior mass has
-            # already been explored under the parent. Reads the same
-            # ``q_source`` so the FPU's scale matches the visited-child
-            # Q scale; falls back to 0 when the parent has no statistic
-            # yet (very first simulation at the search root).
+            # First-play urgency for an UNVISITED child: estimate at the parent's
+            # known Q, reduced by how much prior mass has already been explored
+            # under the parent. Reads the same ``q_source`` so the FPU's scale
+            # matches the visited-child Q scale; falls back to 0 when the parent
+            # has no statistic yet. Floored at ``fpu_baseline`` so a parent
+            # dragged very negative cannot make fresh actions look hopeless.
+            #
+            # PUCT itself does no -inf handling: a never-firing node is marked
+            # dead at its <END> (see ``_run_one_round``) and filtered by the
+            # ``is_dead`` guard above, so a *visited* child never reaches here
+            # with no usable Q. This branch is the unvisited (and defensive)
+            # path only.
             parent_q = self._extract_q(parent)
             if parent_q is None:
                 parent_q = 0.0
@@ -93,7 +108,7 @@ class PUCTSelection(SelectionStrategy):
                 c.prior for c in parent.children if c.N > 0
             )
             q = parent_q - self.fpu_reduction * math.sqrt(visited_prior_mass)
-        u = self.c_puct * child.prior * math.sqrt(sum_n) / (1 + child.N)
+            q = max(q, self.fpu_baseline)
         return q + u
 
     def select(self, parent):

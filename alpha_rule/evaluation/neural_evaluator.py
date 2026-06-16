@@ -18,7 +18,7 @@ the network and only spends the expensive simulator on the chosen step.
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
@@ -59,10 +59,15 @@ class NeuralEvaluator(Evaluator):
         *,
         max_len: int,
         value_scale: float = DEFAULT_VALUE_SCALE,
+        neg_value_scale: Optional[float] = None,
     ):
         if not (value_scale > 0):
             raise ValueError(
                 f"value_scale must be > 0, got {value_scale!r}"
+            )
+        if neg_value_scale is not None and not (neg_value_scale > 0):
+            raise ValueError(
+                f"neg_value_scale must be > 0, got {neg_value_scale!r}"
             )
         self.model = model
         # Inference wrapper: keep the net in eval mode so per-node predict()
@@ -72,6 +77,12 @@ class NeuralEvaluator(Evaluator):
         self.grammar = grammar
         self.max_len = max_len
         self.value_scale = float(value_scale)
+        # Negative-side scale for asymmetric value de-scaling, matching the
+        # ``neg_value_scale`` the replay buffer used when building targets. When
+        # ``None`` it mirrors ``value_scale`` (symmetric, historical behaviour).
+        self.neg_value_scale = (
+            float(neg_value_scale) if neg_value_scale is not None else self.value_scale
+        )
 
     @classmethod
     def from_simulator(
@@ -81,6 +92,7 @@ class NeuralEvaluator(Evaluator):
         simulator,
         *,
         max_len: int,
+        neg_value_scale: Optional[float] = None,
     ) -> "NeuralEvaluator":
         """Build an evaluator whose ``value_scale`` matches the simulator's
         ``reward_scale`` (the same cap ``run_self_play`` / ``ReplayBuffer`` use),
@@ -89,10 +101,14 @@ class NeuralEvaluator(Evaluator):
         constructor when wiring the net into search: the constructor defaults
         ``value_scale=1.0``, which silently mismatches a simulator whose
         ``reward_scale`` is not 1. Falls back to ``1.0`` if the simulator
-        exposes no ``reward_scale``.
+        exposes no ``reward_scale``. ``neg_value_scale`` is passed through for
+        asymmetric de-scaling (``None`` -> symmetric).
         """
         scale = getattr(simulator, "reward_scale", None) or DEFAULT_VALUE_SCALE
-        return cls(model, grammar, max_len=max_len, value_scale=scale)
+        return cls(
+            model, grammar, max_len=max_len,
+            value_scale=scale, neg_value_scale=neg_value_scale,
+        )
 
     def evaluate(self, node) -> EvalResult:
         ids = self.model.tokenizer.encode(node.name, max_len=self.max_len).unsqueeze(0)
@@ -115,7 +131,10 @@ class NeuralEvaluator(Evaluator):
             prod.name: float(priors_cpu[self.model.tokenizer.id_of[prod.name]])
             for prod in applicable
         }
-        return EvalResult(
-            value=float(value.item()) * self.value_scale,
-            priors=priors_dict,
-        )
+        # De-scale the tanh output back to reward units. Asymmetric when
+        # neg_value_scale differs from value_scale (matching how the replay
+        # buffer built the target); identical to ``value * value_scale`` when
+        # they are equal (the symmetric default).
+        z = float(value.item())
+        raw = z * self.value_scale if z >= 0 else z * self.neg_value_scale
+        return EvalResult(value=raw, priors=priors_dict)

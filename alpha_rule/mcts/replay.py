@@ -41,7 +41,7 @@ from __future__ import annotations
 import math
 import random
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 
@@ -94,19 +94,47 @@ class Trajectory:
     """Positive reward cap used to map value targets into ``[-1, +1]``.
     Stamped by ``run_self_play`` from the simulator's ``reward_scale``;
     ``None`` if unknown (callers then apply their own scale / 1.0)."""
+    neg_value_scale: Optional[float] = None
+    """Negative reward cap for ASYMMETRIC value-target scaling: rewards below 0
+    are divided by this instead of ``value_scale``. ``None`` -> falls back to
+    ``value_scale`` (symmetric, the historical behaviour). Set it larger than
+    ``value_scale`` when the positive cap is small (e.g. +3 for 3 boxes) but the
+    penalty tail runs far more negative, so good rules keep full resolution in
+    ``[0, 1]`` while bad rules spread across ``[-1, 0)`` instead of all
+    saturating at ``-1``."""
+    dead_names: List[str] = field(default_factory=list)
+    """Rule names killed during this episode because their ``<END>`` scored
+    ``-inf`` (the rule never fires, so its whole subtree is dead). ``train``
+    folds these into its persistent dead set so future iterations prune them
+    without re-spending a simulator call. Empty for episodes that killed
+    nothing."""
 
-    def value_targets(self, *, value_scale: Optional[float] = None) -> List[float]:
-        """Per-step value target ``z_t = clip(state_value / scale, -1, +1)``.
+    def value_targets(
+        self,
+        *,
+        value_scale: Optional[float] = None,
+        neg_value_scale: Optional[float] = None,
+    ) -> List[float]:
+        """Per-step value target in ``[-1, +1]``. With a single scale this is
+        ``z = clip(state_value / scale, -1, +1)``; with a separate
+        ``neg_value_scale`` the mapping is asymmetric:
 
-        ``scale`` (the positive reward cap) is taken from the argument, else
-        the trajectory's stamped ``value_scale``, else ``1.0``. A step whose
-        ``state_value`` is ``None`` / non-finite falls back to its own clipped
-        ``reward`` (the honest chosen-step eval), or ``-1`` when that too is
-        non-finite -- so the value loss never sees ``None`` / ``-inf`` / NaN.
+            z = min(+1, raw / pos)   for raw >= 0
+            z = max(-1, raw / neg)   for raw < 0
+
+        ``pos`` is the positive cap (arg, else stamped ``value_scale``, else
+        ``1.0``); ``neg`` is the negative cap (arg, else stamped
+        ``neg_value_scale``, else ``pos`` -> symmetric). A step whose
+        ``state_value`` is ``None`` / non-finite falls back to its own
+        ``reward``, or ``-neg`` (which maps to ``-1``) when that too is
+        non-finite, so the value loss never sees ``None`` / ``-inf`` / NaN.
         """
-        scale = value_scale if value_scale is not None else self.value_scale
-        if not scale or scale <= 0:
-            scale = 1.0
+        pos = value_scale if value_scale is not None else self.value_scale
+        if not pos or pos <= 0:
+            pos = 1.0
+        neg = neg_value_scale if neg_value_scale is not None else self.neg_value_scale
+        if not neg or neg <= 0:
+            neg = pos
         targets: List[float] = []
         for s in self.steps:
             rv = s.state_value
@@ -115,8 +143,11 @@ class Trajectory:
             elif math.isfinite(s.reward):
                 raw = s.reward
             else:
-                raw = -scale
-            targets.append(max(-1.0, min(1.0, raw / scale)))
+                raw = -neg
+            if raw >= 0:
+                targets.append(min(1.0, raw / pos))
+            else:
+                targets.append(max(-1.0, raw / neg))
         return targets
 
 
@@ -137,11 +168,21 @@ class ReplayBuffer:
     larger than your throughput; size it to hold a few iterations of self-play).
     """
 
-    def __init__(self, capacity: int = 10_000, value_scale: Optional[float] = None):
+    def __init__(
+        self,
+        capacity: int = 10_000,
+        value_scale: Optional[float] = None,
+        neg_value_scale: Optional[float] = None,
+    ):
         if value_scale is not None and value_scale <= 0:
             raise ValueError(f"value_scale must be > 0, got {value_scale!r}")
+        if neg_value_scale is not None and neg_value_scale <= 0:
+            raise ValueError(
+                f"neg_value_scale must be > 0, got {neg_value_scale!r}"
+            )
         self._buf: deque = deque(maxlen=capacity)
         self.value_scale = value_scale
+        self.neg_value_scale = neg_value_scale
 
     @property
     def capacity(self) -> Optional[int]:
@@ -162,7 +203,8 @@ class ReplayBuffer:
         Each row is ``(state, visit_pi, value_target, applicable_actions)`` when
         ``step.applicable_actions`` is non-empty, else a bare 3-tuple."""
         scale = traj.value_scale if traj.value_scale is not None else self.value_scale
-        zs = traj.value_targets(value_scale=scale)
+        neg = traj.neg_value_scale if traj.neg_value_scale is not None else self.neg_value_scale
+        zs = traj.value_targets(value_scale=scale, neg_value_scale=neg)
         for step, z in zip(traj.steps, zs):
             if step.applicable_actions:
                 self._buf.append(

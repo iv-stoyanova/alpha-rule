@@ -143,6 +143,107 @@ def _apply_root_dirichlet_noise(
         c.prior = float((1.0 - eps) * c.prior + eps * n)
 
 
+def _debug_print_options(
+    parent: MCTSRuleNode,
+    selection: SelectionStrategy,
+    chosen_action: str,
+    *,
+    tag: str,
+    depth: int,
+) -> None:
+    """Print one PUCT table for ``parent``'s children: the search statistics
+    that drove the choice at this construction step.
+
+    One row per child, sorted by PUCT score (the quantity ``selection.select``
+    actually maximises). Columns:
+
+        N        visit count this search
+        Q_max    best value backed up through the child
+        Q_fmean  percentile-filtered mean (``Q_sum / N_passers``), the Q that
+                 ``q_source="filtered_mean"`` reads; ``nan`` until a sample
+                 passes the threshold
+        prior    network prior P(s, a) (1.0 until the net sets it)
+        PUCT     ``selection.score(parent, child)`` = Q + exploration term
+
+    The chosen child is flagged ``*``, a dead child ``x``.
+    """
+    sum_n = sum(c.N for c in parent.children)
+    print(f"  [{tag} d={depth}] PUCT options at {parent.name!r}  (sum_N={sum_n}):")
+    rows = []
+    for c in parent.children:
+        try:
+            puct = float(selection.score(parent, c))
+        except Exception:
+            puct = float("nan")
+        q_fmean = (c.Q_sum / c.N_passers) if c.N_passers > 0 else float("nan")
+        rows.append((c, puct, q_fmean))
+    rows.sort(key=lambda r: (r[1] if math.isfinite(r[1]) else -1e18), reverse=True)
+    for c, puct, q_fmean in rows:
+        mark = "*" if c.parent_action == chosen_action else ("x" if c.is_dead else " ")
+        qmax = "  -inf" if c.Q_max == float("-inf") else f"{c.Q_max:6.2f}"
+        qfm = "   nan" if not math.isfinite(q_fmean) else f"{q_fmean:6.2f}"
+        puct = "  -inf" if not math.isfinite(puct) else f"{puct:7.2f}"
+        print(f"    {mark} {str(c.parent_action):<16} N={c.N:<4d} "
+              f"Q_max={qmax} Q_fmean={qfm} prior={c.prior:.3f} PUCT={puct}")
+
+
+def _debug_print_path(path: List[tuple], *, tag: str) -> None:
+    """Print the production-by-production path this episode committed to:
+    ``<ROOT>`` then one ``-[action]-> rule (r=reward)`` line per chosen step,
+    closing with the best finite-reward step seen along it."""
+    print(f"  [{tag}] self-play path:")
+    print(f"      <ROOT>")
+    best_name, best_r = None, float("-inf")
+    for action, rule, reward in path:
+        rtxt = f"{reward:6.2f}" if math.isfinite(reward) else "  -inf"
+        print(f"        -[{action}]-> {rule}   (r={rtxt})")
+        if math.isfinite(reward) and reward > best_r:
+            best_name, best_r = rule, reward
+    btxt = f"{best_r:.2f}" if math.isfinite(best_r) else "-inf"
+    print(f"      best finite step: {best_name!r}  (r={btxt})")
+
+
+def _debug_print_diag(
+    parent: MCTSRuleNode,
+    chosen_action: str,
+    chosen_node: MCTSRuleNode,
+    *,
+    tag: str,
+    depth: int,
+) -> None:
+    """Answer two diagnostic questions about this committed construction step.
+
+    1. Is the commit picking a DEAD node? It must not: both MCTS selection
+       (``PUCTSelection.select``) and the visit-count commit
+       (``_normalised_visit_distribution``) skip ``is_dead`` children. This
+       prints the chosen node's ``is_dead`` (expected ``False``) next to the
+       count of dead children that DO exist, so a dead pick would stand out.
+       A committed step can still carry ``reward=-inf``: that is a LIVE node
+       whose fresh simulator evaluation failed, not a dead node, and under
+       ``leaf_eval_mode="nn"`` it was never marked dead because the simulator
+       was not called on it during the search (the value head was).
+    2. Is ``END_RULE`` a real option that is merely out-scored? Reports the END
+       (terminal) child's visit count and prior if it was expanded, or notes
+       that the search never expanded it, so it has zero visits and cannot win
+       the visit-count commit. ``END_RULE`` is an applicable production at every
+       non-terminal node, so "never picked" is a search choice, not an
+       unavailable action.
+    """
+    children = parent.children
+    n_dead = sum(1 for c in children if getattr(c, "is_dead", False))
+    end = next((c for c in children if getattr(c, "is_terminal", False)), None)
+    if end is None:
+        end_txt = "END unexpanded (N=0, never selected -> cannot be committed)"
+    else:
+        flag = "CHOSEN" if end.parent_action == chosen_action else "not chosen"
+        end_txt = (f"END expanded N={end.N} prior={end.prior:.3f} "
+                   f"dead={end.is_dead} ({flag})")
+    print(f"  [{tag} d={depth}] diag: chosen is_dead="
+          f"{getattr(chosen_node, 'is_dead', False)} | "
+          f"children {len(children)}/{parent.n_possible_actions} expanded "
+          f"(dead {n_dead}) | {end_txt}")
+
+
 def _run_one_round(
     root: MCTSRuleNode,
     *,
@@ -155,6 +256,9 @@ def _run_one_round(
     leaf_eval_mode: str = "nn",
     dead_rule_names: Optional[Set[str]] = None,
     depth_limit: Optional[int] = None,
+    newly_dead: Optional[Set[str]] = None,
+    debug: int = 0,
+    debug_tag: str = "",
 ) -> None:
     """
     Run ``n_simulations`` simulations from ``root``, updating the subtree in
@@ -184,14 +288,29 @@ def _run_one_round(
     if root.is_fully_expanded() and root.children and all(c.is_dead for c in root.children):
         return
 
-    for _ in range(n_simulations):
+    for sim_i in range(n_simulations):
         node = root
 
         # Selection.
         while node.is_fully_expanded() and node.children:
+            if debug >= 3:
+                scored = sorted(
+                    ((c.parent_action, selection.score(node, c)) for c in node.children),
+                    key=lambda kv: (kv[1] if math.isfinite(kv[1]) else -1e18),
+                    reverse=True,
+                )
+                shown = ", ".join(
+                    f"{a}={'-inf' if not math.isfinite(s) else f'{s:.2f}'}"
+                    for a, s in scored[:8]
+                )
+                print(f"  [{debug_tag}] sim{sim_i} select at {node.name!r}: {shown}"
+                      + (" ..." if len(scored) > 8 else ""))
             picked = selection.select(node)
             if picked is None:
                 break
+            if debug >= 3:
+                print(f"  [{debug_tag}] sim{sim_i}   -> picked {picked.name!r} "
+                      f"(N={picked.N})")
             node = picked
         if node is None:
             continue
@@ -207,10 +326,15 @@ def _run_one_round(
             if new_child is None:
                 continue
             node = new_child
+            if debug >= 3:
+                print(f"  [{debug_tag}] sim{sim_i} expand -> {node.name!r}")
             # If this rule already scored -inf in an earlier episode, mark it
             # dead now so no rollout spends a simulator call on it.
             if dead_rule_names and node.name in dead_rule_names:
                 node.is_dead = True
+                if debug >= 3:
+                    print(f"  [{debug_tag}] sim{sim_i}   marked dead "
+                          f"(in dead set): {node.name!r}")
             # Ask the network for priors on the parent so PUCT can use them on
             # later visits.
             if network_evaluator is not None and node.parent is not None:
@@ -221,6 +345,8 @@ def _run_one_round(
         # -inf with no simulator/network call.
         if getattr(node, "is_dead", False):
             backup.update(node, float("-inf"))
+            if debug >= 3:
+                print(f"  [{debug_tag}] sim{sim_i} leaf {node.name!r} DEAD -> -inf")
             continue
         is_terminal_leaf = getattr(node, "is_terminal", False)
         if (
@@ -229,9 +355,37 @@ def _run_one_round(
             and network_evaluator is not None
         ):
             result = _to_eval_result(network_evaluator.evaluate(node))
+            mode = "nn"
         else:
             result = _to_eval_result(simulator.evaluate(node))
+            mode = "sim"
+        if debug >= 3:
+            v = result.value
+            vtxt = f"{v:.2f}" if math.isfinite(v) else ("-inf" if v < 0 else "nan")
+            print(f"  [{debug_tag}] sim{sim_i} eval {node.name!r} "
+                  f"({'terminal' if is_terminal_leaf else 'leaf'}) "
+                  f"via {mode} -> {vtxt}")
         backup.update(node, result.value)
+
+        # A terminal <END> that scores -inf means the rule it terminates never
+        # fires. By the grammar's monotone specificity no extension of that rule
+        # can fire either, so the whole subtree is dead: mark the rule node (the
+        # <END>'s parent) dead so the search stops selecting and committing it
+        # this episode, and record its name so train() prunes it in future
+        # iterations too (no simulator call re-spent on it). Node-local: only
+        # the rule node dies; nothing is pushed onto its ancestors or siblings.
+        if (
+            is_terminal_leaf
+            and result.value == float("-inf")
+            and node.parent is not None
+            and not node.parent.is_dead
+        ):
+            node.parent.is_dead = True
+            if newly_dead is not None:
+                newly_dead.add(node.parent.name)
+            if debug >= 3:
+                print(f"  [{debug_tag}] sim{sim_i}   rule {node.parent.name!r} "
+                      f"never fires -> marked dead (subtree pruned)")
 
 
 def run_self_play(
@@ -252,7 +406,10 @@ def run_self_play(
     leaf_eval_mode: str = "nn",
     value_target: Optional[ValueTarget] = None,
     value_scale: Optional[float] = None,
+    neg_value_scale: Optional[float] = None,
     dead_rule_names: Optional[Set[str]] = None,
+    debug: int = 0,
+    debug_tag: str = "",
 ) -> Trajectory:
     """
     Run one self-play episode and return its ``Trajectory``.
@@ -293,10 +450,26 @@ def run_self_play(
         value_scale: positive reward cap used downstream to scale targets into
             ``[-1, +1]``. Defaults to the simulator's ``reward_scale`` if set,
             else ``None``. Stamped onto the returned ``Trajectory``.
+        neg_value_scale: negative reward cap for asymmetric value scaling.
+            ``None`` (default) mirrors ``value_scale`` (symmetric). Stamped onto
+            the returned ``Trajectory`` so the buffer scales targets to match.
         dead_rule_names: optional set of rule names already known to score
             ``-inf`` (e.g. gathered across episodes by ``train``). Matching
             children are marked dead on creation, so no simulator call is spent
             on them.
+        debug: verbosity of the per-step diagnostic prints (default 0, off).
+            ``1`` prints, for each committed construction step, which child was
+            chosen with its value, and at the end the full self-play path. ``2``
+            additionally prints the PUCT option table at every step (every
+            child's N / Q_max / filtered-mean Q / prior / PUCT score), i.e. the
+            full search landscape the choice was made over. ``3`` additionally
+            traces every MCTS simulation inside the round: the round header
+            (depth + node), each selection step with its candidate PUCT scores
+            and the pick, each expansion, each leaf evaluation with its mode
+            (``nn``/``sim``) and value, and any dead/forbidden marking. Very
+            verbose; prints only, never changes what the search does.
+        debug_tag: short label prefixed to every debug line (e.g. ``"it=3"``),
+            so interleaved output from many episodes stays attributable.
     """
     # Validate the Dirichlet params up front so bad input fails fast.
     if dirichlet_eps < 0.0 or dirichlet_eps > 1.0:
@@ -317,6 +490,10 @@ def run_self_play(
     # Auto-read the reward scale off the simulator when not given explicitly.
     if value_scale is None:
         value_scale = getattr(simulator, "reward_scale", None)
+    # Negative-side cap for asymmetric value scaling; defaults to the positive
+    # cap (symmetric, historical behaviour) when not given.
+    if neg_value_scale is None:
+        neg_value_scale = value_scale
     expansion = RuleExpansion(grammar)
     rng = rng or np.random.default_rng()
     forbidden: Set[str] = (
@@ -327,6 +504,10 @@ def run_self_play(
         set(dead_rule_names) if dead_rule_names else set()
     )
 
+    if debug >= 3 and (forbidden or dead_set):
+        print(f"  [{debug_tag}] removing sets -> forbidden={sorted(forbidden)} "
+              f"dead={sorted(dead_set)}")
+
     root = grammar.root()
     if forbidden:
         # Pre-expand the root and mark forbidden branches dead before any
@@ -336,10 +517,18 @@ def run_self_play(
         for child in root.children:
             if child.parent_action in forbidden:
                 child.is_dead = True
+                if debug >= 3:
+                    print(f"  [{debug_tag}] forbidden -> dead: {child.name!r}")
             elif dead_set and child.name in dead_set:
                 child.is_dead = True
+                if debug >= 3:
+                    print(f"  [{debug_tag}] dead-set -> dead: {child.name!r}")
     steps: List[TrajectoryStep] = []
     current = root
+    debug_path: List[tuple] = []
+    # Rule names killed mid-episode (a <END> scored -inf). Stamped on the
+    # returned Trajectory so train() folds them into its persistent dead set.
+    newly_dead: Set[str] = set()
 
     for depth_step in range(depth_limit):
         # Dirichlet noise on the root's child priors, once per step (skipped
@@ -359,6 +548,10 @@ def run_self_play(
                 current, eps=dirichlet_eps, alpha=dirichlet_alpha, rng=rng,
             )
 
+        if debug >= 3:
+            print(f"  [{debug_tag}] === round at depth={depth_step} "
+                  f"node={current.name!r} (level={current.level}, N={current.N}) "
+                  f"x{n_simulations} sims ===")
         _run_one_round(
             current,
             n_simulations=n_simulations,
@@ -370,7 +563,14 @@ def run_self_play(
             leaf_eval_mode=leaf_eval_mode,
             dead_rule_names=dead_set if dead_set else None,
             depth_limit=depth_limit,
+            newly_dead=newly_dead,
+            debug=debug,
+            debug_tag=debug_tag,
         )
+        # Fold rules killed this round into the live dead set so later steps of
+        # this same episode skip them on expansion too.
+        if newly_dead:
+            dead_set.update(newly_dead)
         # Policy TARGET: the raw visit fractions at tau=1 -- the AlphaZero
         # training signal stored in the trajectory and regressed by the policy
         # head. It is computed independently of the action-sampling temperature
@@ -399,6 +599,27 @@ def run_self_play(
         # Stamp the realised reward on the chosen node so the RealizedReturn
         # value target can read it (this node becomes next step's ``current``).
         next_node.realized_reward = chosen_reward
+
+        # Diagnostic prints (off by default). Level 2 dumps the full PUCT
+        # landscape this step chose over; level 1 logs just the chosen child
+        # and its value. Strictly observational -- no effect on the search.
+        if debug >= 2:
+            _debug_print_options(
+                current, sel, action_name, tag=debug_tag, depth=depth_step,
+            )
+        if debug >= 1:
+            rtxt = f"{chosen_reward:.2f}" if math.isfinite(chosen_reward) else "-inf"
+            qfm = (next_node.Q_sum / next_node.N_passers) if next_node.N_passers > 0 else float("nan")
+            qfmtxt = f"{qfm:.2f}" if math.isfinite(qfm) else "nan"
+            qmaxtxt = "-inf" if next_node.Q_max == float("-inf") else f"{next_node.Q_max:.2f}"
+            print(f"  [{debug_tag} d={depth_step}] chose {action_name!r} "
+                  f"-> {next_node.name!r}  N={next_node.N} "
+                  f"Q_max={qmaxtxt} Q_fmean={qfmtxt} reward={rtxt}")
+            _debug_print_diag(
+                current, action_name, next_node, tag=debug_tag, depth=depth_step,
+            )
+        debug_path.append((action_name, next_node.name, chosen_reward))
+
         applicable = tuple(
             p.name for p in grammar.applicable_productions(current)
         )
@@ -418,4 +639,10 @@ def run_self_play(
         if grammar.is_terminal(current):
             break
 
-    return Trajectory(steps=steps, value_scale=value_scale)
+    if debug >= 1:
+        _debug_print_path(debug_path, tag=debug_tag)
+
+    return Trajectory(
+        steps=steps, value_scale=value_scale, neg_value_scale=neg_value_scale,
+        dead_names=sorted(newly_dead),
+    )
