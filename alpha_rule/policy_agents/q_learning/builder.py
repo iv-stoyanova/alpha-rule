@@ -26,8 +26,19 @@ def get_state_tuple(env, context_obs, get_otc=None):
     """
     if get_otc is None:
         get_otc = find_attr_in_wrappers(env, "get_otc")
-    box_obs = get_otc().get_observations()["open"]
-    return tuple(context_obs) + tuple(box_obs)
+    # Read the box-open bits at their source when the env exposes ``boxes``.
+    # ``get_observations()`` rebuilds the full stb3-formatted observation (active
+    # list, labelled context event, numpy reshapes) and we would keep only its
+    # ``"open"`` field, which is exactly ``[box.is_open() for box in boxes]``;
+    # reading the boxes directly skips that work. Envs that expose only
+    # ``get_observations`` (e.g. minimal test stubs) fall back to it.
+    otc = get_otc()
+    boxes = getattr(otc, "boxes", None)
+    if boxes is not None:
+        box_obs = tuple(int(box.is_open()) for box in boxes)
+    else:
+        box_obs = tuple(otc.get_observations()["open"])
+    return tuple(context_obs) + box_obs
 
 
 def _q_table_get(q_table, state, n_actions):

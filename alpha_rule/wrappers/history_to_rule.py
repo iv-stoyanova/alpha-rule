@@ -157,8 +157,9 @@ class HistoryToRuleWrapperBase(gym.ObservationWrapper):
             m[2, 0] = "="
             # Indicator is always all-ones (a real event type in row 1 means the
             # single column is never removable), so skip the per-step
-            # check_rows_columns_combined (np.isin over an object array).
-            m[0] = np.ones(1, dtype=int)
+            # check_rows_columns_combined (np.isin over an object array). The
+            # scalar 1 broadcasts across the row without allocating an array.
+            m[0] = 1
             self._history_matrix = m
             return
 
@@ -189,8 +190,9 @@ class HistoryToRuleWrapperBase(gym.ObservationWrapper):
             new[i + 2, i] = "="
 
         # Always all-ones under the real-type invariant (see the assert above),
-        # so skip the object-array check_rows_columns_combined recompute.
-        new[0] = np.ones(n_new, dtype=int)
+        # so skip the object-array check_rows_columns_combined recompute; the
+        # scalar 1 broadcasts across the row without allocating an array.
+        new[0] = 1
         self._history_matrix = new
 
     def _trim_oldest_from_matrix(self):
@@ -203,8 +205,8 @@ class HistoryToRuleWrapperBase(gym.ObservationWrapper):
             return
         trimmed = self._history_matrix[:n + 1, :n - 1].copy()
         # Dropping the oldest column leaves real types in row 1, so the
-        # indicator stays all-ones; no recompute needed.
-        trimmed[0] = np.ones(n - 1, dtype=int)
+        # indicator stays all-ones; assign the scalar 1 (broadcasts).
+        trimmed[0] = 1
         self._history_matrix = trimmed
 
     # ------------------------------------------------------------------ #
