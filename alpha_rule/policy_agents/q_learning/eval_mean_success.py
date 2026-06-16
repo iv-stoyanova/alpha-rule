@@ -36,7 +36,6 @@ def q_learning_agent_eval_mean_reward_success_steps(agent, env, n_eval_episodes=
     get_otc = find_attr_in_wrappers(env, "get_otc")
 
     for _ in range(n_eval_episodes):
-        # print("resetting")
         context_obs = env.reset()
         if isinstance(context_obs, tuple):
             context_obs = context_obs[0]
@@ -47,9 +46,6 @@ def q_learning_agent_eval_mean_reward_success_steps(agent, env, n_eval_episodes=
         while not (done or truncated):
             full_state = get_state_tuple(env, context_obs, get_otc=get_otc)
             action = policy(full_state)
-            # The action is stepped as-is; any one-hot/box remapping is owned by
-            # an upstream action wrapper (OneHotBoxActionWrapper), so the policy
-            # is interpreted the same way here as during training.
             # The candidate rule is the last column of context_obs, gated so a
             # context rule firing this step does not count.
             if not candidate_seen:
@@ -61,13 +57,6 @@ def q_learning_agent_eval_mean_reward_success_steps(agent, env, n_eval_episodes=
                 if fired:
                     candidate_seen = True
             context_obs, reward, done, truncated, info = env.step(action)
-            # print( f"reward: {reward} ")
-            if done:
-                # print("all chest open")
-                pass
-            if truncated:
-                # print("truncated")
-                pass
             if isinstance(context_obs, tuple):
                 context_obs = context_obs[0]
             total_reward += reward

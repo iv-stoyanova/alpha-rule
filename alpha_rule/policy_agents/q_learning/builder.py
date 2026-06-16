@@ -50,6 +50,7 @@ def q_learning_agent_builder(
         check_interval=200,
         patience=3,
         seed=None,
+        open_bonus=10.0,
 ):
     """
     Build and train a tabular Q-learning agent.
@@ -76,6 +77,10 @@ def q_learning_agent_builder(
         seed: if given, makes training reproducible: ε-greedy draws use a
             local ``np.random.Generator(seed)`` and the action space is seeded
             for ``sample()``. ``None`` uses the global ``np.random``.
+        open_bonus: reward shaping added to any positive step reward during
+            training, to push the agent toward opening boxes rather than idling.
+            Applied only here (the evaluators score the raw reward). ``0.0``
+            disables it.
 
     Returns:
         ``(q_table, policy)`` where ``policy(full_state)`` returns an int
@@ -114,15 +119,13 @@ def q_learning_agent_builder(
         else:
             action = int(np.argmax(state_q))
 
-        # Step with the agent's action directly; any one-hot/box remapping is
-        # owned by an upstream action wrapper (OneHotBoxActionWrapper), not by
-        # this builder, so the same action is interpreted identically in
-        # training and evaluation.
+        # The action is stepped as-is; any box remapping is owned by an upstream
+        # action wrapper (OneHotBoxActionWrapper), so training and evaluation
+        # interpret it the same way.
         next_obs, reward, done, truncated, *_ = env.step(action)
-        # Open-chest bonus: amplify the positive reward so the agent is strongly
-        # motivated to open a box rather than play it safe.
-        if reward > 0:
-            reward += 10
+        # Shape positive rewards to push the agent toward opening boxes.
+        if open_bonus and reward > 0:
+            reward += open_bonus
         if isinstance(next_obs, tuple):
             next_obs = next_obs[0]
 
@@ -130,13 +133,6 @@ def q_learning_agent_builder(
         # A terminal step has no successor, so its target is the reward alone.
         # Truncation is treated the same way, since the state carries no time
         # feature.
-        # print(f"reward: {reward} ")
-        if done:
-            # print("all chest open")
-            pass
-        if truncated:
-            # print("truncated")
-            pass
         if done or truncated:
             td_target = reward
         else:
@@ -180,7 +176,4 @@ def q_learning_agent_builder(
             return 0
         return int(np.argmax(arr))
 
-    # print(policy)
-    # print(q_table)
-    # print("a"+5)
     return q_table, policy

@@ -33,14 +33,12 @@ class ValueHead(nn.Module):
     def __init__(self, d_model: int):
         super().__init__()
         self.linear = nn.Linear(d_model, 1)
-        # Zero-init so an UNTRAINED value head outputs exactly 0 (tanh(0)) for
-        # every input. PyTorch's default Linear init gives a small random bias,
-        # which makes every leaf read mildly positive at iteration 0; under
-        # MCTS that uniform optimism gets backed up and the search locks onto
-        # whichever node it first expands. Starting at 0 keeps untrained leaves
-        # neutral so the real (simulator) signals on terminals and chosen steps
-        # drive the early search. Gradients still flow once targets arrive
-        # (d tanh(Wh+b)/dW = (1-tanh^2)*h = h at W=b=0), so learning is intact.
+        # Zero-init so an untrained value head outputs 0 (tanh(0)) for every
+        # input. The default init reads mildly positive at iteration 0, and that
+        # uniform optimism gets backed up so the search latches onto whichever
+        # node it first expands; starting at 0 keeps untrained leaves neutral and
+        # lets the simulator signals drive the early search. Gradients still flow
+        # once targets arrive (d tanh(Wh+b)/dW = h at W=b=0).
         nn.init.zeros_(self.linear.weight)
         nn.init.zeros_(self.linear.bias)
 

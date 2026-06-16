@@ -212,7 +212,6 @@ class HistoryToRuleWrapperBase(gym.ObservationWrapper):
             rule_validation[ind] = match_rule_to_matrix(
                 rule_matrix, self._history_matrix,
             )
-
         return rule_validation
 
     def reset(self, **kwargs):

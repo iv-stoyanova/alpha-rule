@@ -183,8 +183,10 @@ def test_terminal_transitions_do_not_bootstrap():
         from alpha_rule.policy_agents.q_learning.builder import q_learning_agent_builder
 
         env = _StepCountingEnv(reward=1.0, episode_len=1)      # every step terminal
+        # open_bonus=0 so the reward stays 1.0 and this isolates the terminal
+        # bootstrap behaviour from reward shaping.
         q_table, _policy = q_learning_agent_builder(
-            env, total_timesteps=3000, epsilon=0.2,
+            env, total_timesteps=3000, epsilon=0.2, open_bonus=0.0,
         )
         max_q = max(float(np.max(arr)) for arr in q_table.values())
         assert max_q < 2.0, f"terminal Q bootstrapped too high ({max_q:.2f}); should be ~1.0"

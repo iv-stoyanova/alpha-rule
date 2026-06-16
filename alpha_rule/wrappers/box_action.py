@@ -17,7 +17,7 @@ So for 3 boxes the agent's ``{0, 1, 2, 3}`` become env actions ``{0, 4, 2, 1}``
 hardcoded, so it scales to any ``n``.
 
 Because the mapping lives in one wrapper, training and evaluation both step the
-env with the agent's raw action and get the same interpretation -- no per-call
+env with the agent's action and interpret it the same way, with no per-call
 remapping in the builder or the evaluators.
 """
 from __future__ import annotations
@@ -31,7 +31,7 @@ class OneHotBoxActionWrapper(gym.ActionWrapper):
 
     Args:
         env: an env (possibly already observation-wrapped) whose
-            ``action_space`` is ``Discrete(2**n_boxes)`` -- the OTC button mask.
+            ``action_space`` is ``Discrete(2**n_boxes)``, the OTC button mask.
 
     Raises:
         ValueError: if the wrapped action space is not ``Discrete`` of a

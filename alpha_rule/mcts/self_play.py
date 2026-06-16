@@ -151,21 +151,12 @@ def _debug_print_options(
     tag: str,
     depth: int,
 ) -> None:
-    """Print one PUCT table for ``parent``'s children: the search statistics
-    that drove the choice at this construction step.
+    """Print the PUCT table for ``parent``'s children, sorted by PUCT score.
 
-    One row per child, sorted by PUCT score (the quantity ``selection.select``
-    actually maximises). Columns:
-
-        N        visit count this search
-        Q_max    best value backed up through the child
-        Q_fmean  percentile-filtered mean (``Q_sum / N_passers``), the Q that
-                 ``q_source="filtered_mean"`` reads; ``nan`` until a sample
-                 passes the threshold
-        prior    network prior P(s, a) (1.0 until the net sets it)
-        PUCT     ``selection.score(parent, child)`` = Q + exploration term
-
-    The chosen child is flagged ``*``, a dead child ``x``.
+    Columns: N (visit count), Q_max (best value backed up), Q_fmean (the
+    percentile-filtered mean ``Q_sum / N_passers``), prior (network P(s, a)),
+    PUCT (``selection.score``). The chosen child is flagged ``*``, a dead child
+    ``x``.
     """
     sum_n = sum(c.N for c in parent.children)
     print(f"  [{tag} d={depth}] PUCT options at {parent.name!r}  (sum_N={sum_n}):")
@@ -211,23 +202,10 @@ def _debug_print_diag(
     tag: str,
     depth: int,
 ) -> None:
-    """Answer two diagnostic questions about this committed construction step.
-
-    1. Is the commit picking a DEAD node? It must not: both MCTS selection
-       (``PUCTSelection.select``) and the visit-count commit
-       (``_normalised_visit_distribution``) skip ``is_dead`` children. This
-       prints the chosen node's ``is_dead`` (expected ``False``) next to the
-       count of dead children that DO exist, so a dead pick would stand out.
-       A committed step can still carry ``reward=-inf``: that is a LIVE node
-       whose fresh simulator evaluation failed, not a dead node, and under
-       ``leaf_eval_mode="nn"`` it was never marked dead because the simulator
-       was not called on it during the search (the value head was).
-    2. Is ``END_RULE`` a real option that is merely out-scored? Reports the END
-       (terminal) child's visit count and prior if it was expanded, or notes
-       that the search never expanded it, so it has zero visits and cannot win
-       the visit-count commit. ``END_RULE`` is an applicable production at every
-       non-terminal node, so "never picked" is a search choice, not an
-       unavailable action.
+    """Print two diagnostics for the committed step: whether the chosen node is
+    dead (it should never be, since selection and the visit-count commit both
+    skip dead children) alongside the dead-child count, and whether the
+    ``END_RULE`` child was expanded and how it ranked.
     """
     children = parent.children
     n_dead = sum(1 for c in children if getattr(c, "is_dead", False))
@@ -277,7 +255,7 @@ def _run_one_round(
     ``depth_limit`` caps the search depth: a node at ``level == depth_limit``
     is a valid leaf to evaluate but is never expanded deeper. The committed
     trajectory only ever reaches ``depth_limit`` productions, so searching past
-    it evaluates rules that can never be the final answer -- wasting simulator /
+    it evaluates rules that can never be the final answer, wasting simulator /
     network calls and (with a tight ``max_len``) overflowing the tokenizer mid
     search. ``None`` leaves the search uncapped.
     """
@@ -367,13 +345,12 @@ def _run_one_round(
                   f"via {mode} -> {vtxt}")
         backup.update(node, result.value)
 
-        # A terminal <END> that scores -inf means the rule it terminates never
-        # fires. By the grammar's monotone specificity no extension of that rule
-        # can fire either, so the whole subtree is dead: mark the rule node (the
-        # <END>'s parent) dead so the search stops selecting and committing it
-        # this episode, and record its name so train() prunes it in future
-        # iterations too (no simulator call re-spent on it). Node-local: only
-        # the rule node dies; nothing is pushed onto its ancestors or siblings.
+        # A terminal <END> scoring -inf means the rule never fires. The grammar
+        # is monotone (extensions only add constraints), so no extension can
+        # fire either and the whole subtree is dead. Mark the rule node (the
+        # <END>'s parent) dead so the search stops committing it this episode,
+        # and record its name so train() prunes it in later iterations. Only the
+        # rule node dies; its ancestors and siblings are untouched.
         if (
             is_terminal_leaf
             and result.value == float("-inf")
@@ -571,7 +548,7 @@ def run_self_play(
         # this same episode skip them on expansion too.
         if newly_dead:
             dead_set.update(newly_dead)
-        # Policy TARGET: the raw visit fractions at tau=1 -- the AlphaZero
+        # Policy TARGET: the raw visit fractions at tau=1, the AlphaZero
         # training signal stored in the trajectory and regressed by the policy
         # head. It is computed independently of the action-sampling temperature
         # below, so annealing the choice toward argmax never collapses the
@@ -602,7 +579,7 @@ def run_self_play(
 
         # Diagnostic prints (off by default). Level 2 dumps the full PUCT
         # landscape this step chose over; level 1 logs just the chosen child
-        # and its value. Strictly observational -- no effect on the search.
+        # and its value. Observational only; no effect on the search.
         if debug >= 2:
             _debug_print_options(
                 current, sel, action_name, tag=debug_tag, depth=depth_step,
