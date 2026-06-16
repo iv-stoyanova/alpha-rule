@@ -99,8 +99,9 @@ def _restore_discrete(orig):
         gym.spaces.Discrete = orig
 
 
-def test_q_learning_default_runs_full_timesteps():
-    """Default ``early_stop_tol=0.0`` keeps the loop at exactly ``total_timesteps`` steps."""
+def test_q_learning_disabled_early_stop_runs_full_timesteps():
+    """Explicit ``early_stop_tol=0.0`` disables early stopping and keeps the
+    loop at exactly ``total_timesteps`` steps."""
     if not _HAS_GYM:
         return
     orig = _patch_discrete_isinstance()
@@ -108,11 +109,32 @@ def test_q_learning_default_runs_full_timesteps():
         from alpha_rule.policy_agents.q_learning.builder import q_learning_agent_builder
 
         env = _StepCountingEnv(reward=0.0, episode_len=100)
-        q_table, policy = q_learning_agent_builder(env, total_timesteps=300)
+        q_table, policy = q_learning_agent_builder(
+            env, total_timesteps=300, early_stop_tol=0.0)
         assert env.steps == 300, f"expected 300 steps, got {env.steps}"
         # Policy is callable and returns an int action.
         first_state = next(iter(q_table.keys()))
         assert isinstance(policy(first_state), int)
+    finally:
+        _restore_discrete(orig)
+
+
+def test_q_learning_default_early_stops_on_converged_table():
+    """The default ``early_stop_tol`` is now > 0, so a settled Q-table stops
+    before exhausting a large ``total_timesteps`` budget. Zero reward keeps the
+    table at its init value, so the per-check delta is 0 and early stop fires."""
+    if not _HAS_GYM:
+        return
+    orig = _patch_discrete_isinstance()
+    try:
+        from alpha_rule.policy_agents.q_learning.builder import q_learning_agent_builder
+
+        env = _StepCountingEnv(reward=0.0, episode_len=100)
+        q_table, _policy = q_learning_agent_builder(env, total_timesteps=10_000)
+        assert env.steps < 10_000, (
+            f"default early_stop_tol should stop a converged table early, "
+            f"got {env.steps} steps"
+        )
     finally:
         _restore_discrete(orig)
 

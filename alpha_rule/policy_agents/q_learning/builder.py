@@ -46,7 +46,7 @@ def q_learning_agent_builder(
         alpha=0.1,
         gamma=0.97,
         epsilon=0.1,
-        early_stop_tol=0.0,
+        early_stop_tol=5.0,
         check_interval=200,
         patience=3,
         seed=None,
@@ -68,8 +68,14 @@ def q_learning_agent_builder(
             Q-table has stopped changing meaningfully. Every
             ``check_interval`` steps the max absolute delta across visited
             states is compared against this tolerance; if it stays below
-            for ``patience`` consecutive checks the loop exits. Default
-            ``0.0`` disables (preserves the pre-change behaviour).
+            for ``patience`` consecutive checks the loop exits. The default
+            ``5.0`` is on the raw Q-value scale (per-step reward magnitudes
+            reach roughly ``open_bonus`` on a chest open), so it fires once
+            the table has settled to within a few reward units. On the small
+            OTC state spaces this saves most of a large ``total_timesteps``
+            budget and avoids over-training, while self-adjusting to larger
+            state spaces (which keep deltas above the tolerance longer). Set
+            ``0.0`` to disable and always run the full ``total_timesteps``.
         check_interval: steps between convergence checks. Ignored when
             ``early_stop_tol == 0``.
         patience: number of consecutive sub-tolerance checks required to
