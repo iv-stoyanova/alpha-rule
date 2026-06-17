@@ -15,6 +15,7 @@ from alpha_rule.mcts.backprop import (  # noqa: F401
 )
 from alpha_rule.mcts.expansion import ExpansionStrategy, RuleExpansion  # noqa: F401
 from alpha_rule.mcts.node import MCTSRuleNode  # noqa: F401
+from alpha_rule.mcts.normalize import RewardNormalizer  # noqa: F401
 from alpha_rule.mcts.replay import (  # noqa: F401
     ReplayBuffer,
     Trajectory,
@@ -43,6 +44,7 @@ __all__ = [
     "PercentileRewardBackup",
     "RealizedReturn",
     "ReplayBuffer",
+    "RewardNormalizer",
     "RuleExpansion",
     "SelectionStrategy",
     "Trajectory",

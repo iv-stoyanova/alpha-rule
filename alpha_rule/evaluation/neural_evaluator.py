@@ -60,6 +60,8 @@ class NeuralEvaluator(Evaluator):
         max_len: int,
         value_scale: float = DEFAULT_VALUE_SCALE,
         neg_value_scale: Optional[float] = None,
+        normalizer=None,
+        norm_k: float = 2.0,
     ):
         if not (value_scale > 0):
             raise ValueError(
@@ -83,6 +85,11 @@ class NeuralEvaluator(Evaluator):
         self.neg_value_scale = (
             float(neg_value_scale) if neg_value_scale is not None else self.value_scale
         )
+        # Optional RewardNormalizer; when set, de-scale the tanh output via
+        # ``normalizer.denormalize`` (the inverse of the value target's
+        # ``normalize``). None keeps the asymmetric value_scale/neg_value_scale.
+        self.normalizer = normalizer
+        self.norm_k = norm_k
 
     @classmethod
     def from_simulator(
@@ -93,6 +100,8 @@ class NeuralEvaluator(Evaluator):
         *,
         max_len: int,
         neg_value_scale: Optional[float] = None,
+        normalizer=None,
+        norm_k: float = 2.0,
     ) -> "NeuralEvaluator":
         """Build an evaluator whose ``value_scale`` matches the simulator's
         ``reward_scale`` (the same cap ``run_self_play`` / ``ReplayBuffer`` use),
@@ -108,6 +117,7 @@ class NeuralEvaluator(Evaluator):
         return cls(
             model, grammar, max_len=max_len,
             value_scale=scale, neg_value_scale=neg_value_scale,
+            normalizer=normalizer, norm_k=norm_k,
         )
 
     def evaluate(self, node) -> EvalResult:
@@ -131,10 +141,12 @@ class NeuralEvaluator(Evaluator):
             prod.name: float(priors_cpu[self.model.tokenizer.id_of[prod.name]])
             for prod in applicable
         }
-        # De-scale the tanh output back to reward units. Asymmetric when
-        # neg_value_scale differs from value_scale (matching how the replay
-        # buffer built the target); identical to ``value * value_scale`` when
-        # they are equal (the symmetric default).
+        # De-scale the tanh output to reward units for the MCTS backup. With a
+        # normalizer, use its denormalize (inverse of the value target); else the
+        # asymmetric value_scale/neg_value_scale de-scale.
         z = float(value.item())
-        raw = z * self.value_scale if z >= 0 else z * self.neg_value_scale
+        if self.normalizer is not None:
+            raw = self.normalizer.denormalize(z, self.norm_k)
+        else:
+            raw = z * self.value_scale if z >= 0 else z * self.neg_value_scale
         return EvalResult(value=raw, priors=priors_dict)

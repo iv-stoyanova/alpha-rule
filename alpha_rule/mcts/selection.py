@@ -48,6 +48,8 @@ class PUCTSelection(SelectionStrategy):
         fpu_reduction: float = 0.25,
         q_source: str = "max",
         fpu_baseline: float = float("-inf"),
+        normalizer=None,
+        norm_k: float = 2.0,
     ):
         if fpu_reduction < 0.0:
             raise ValueError(
@@ -61,6 +63,10 @@ class PUCTSelection(SelectionStrategy):
         self.c_puct = c_puct
         self.fpu_reduction = fpu_reduction
         self.q_source = q_source
+        # Optional RewardNormalizer; when set, Q is normalized before the
+        # exploration term is added. None keeps the raw-Q behaviour.
+        self.normalizer = normalizer
+        self.norm_k = norm_k
         # Lower bound on the first-play-urgency value for UNVISITED children.
         # Default ``-inf`` is a no-op (historical behaviour). A finite value
         # (e.g. 0) stops a parent dragged very negative by bad sibling backups
@@ -82,13 +88,22 @@ class PUCTSelection(SelectionStrategy):
         # q_source == "filtered_mean"
         return (node.Q_sum / node.N_passers) if node.N_passers > 0 else None
 
+    def _normalize(self, q):
+        """Map a raw Q into ``[-1, 1]`` via the normalizer, or return it
+        unchanged when no normalizer is set (raw-Q behaviour)."""
+        if self.normalizer is None:
+            return q
+        return self.normalizer.normalize(q, self.norm_k)
+
     def score(self, parent, child) -> float:
         if child.is_dead:
             return float("-inf")
         sum_n = max(1, sum(c.N for c in parent.children))
         u = self.c_puct * child.prior * math.sqrt(sum_n) / (1 + child.N)
         q = self._extract_q(child) if child.N > 0 else None
-        if q is None:
+        if q is not None:
+            q = self._normalize(q)            # exploration term below is unscaled
+        else:
             # First-play urgency for an unvisited child: estimate at the
             # parent's known Q, reduced by how much prior mass has already been
             # explored under the parent. Reads the same ``q_source`` so the
@@ -96,8 +111,7 @@ class PUCTSelection(SelectionStrategy):
             # has no statistic yet. Floored at ``fpu_baseline`` so a parent
             # dragged very negative cannot make fresh actions look hopeless.
             parent_q = self._extract_q(parent)
-            if parent_q is None:
-                parent_q = 0.0
+            parent_q = 0.0 if parent_q is None else self._normalize(parent_q)
             visited_prior_mass = sum(
                 c.prior for c in parent.children if c.N > 0
             )

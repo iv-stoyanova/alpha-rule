@@ -102,6 +102,18 @@ class Trajectory:
     penalty tail runs far more negative, so good rules keep full resolution in
     ``[0, 1]`` while bad rules spread across ``[-1, 0)`` instead of all
     saturating at ``-1``."""
+    norm_mean: Optional[float] = None
+    """Running reward mean stamped by ``run_self_play`` when read-time
+    normalization is ON. When ``norm_mean`` and ``norm_std`` are both set,
+    ``value_targets`` uses the recentered single-scale mapping
+    ``z = clip((raw - norm_mean) / (norm_k * norm_std), -1, +1)`` instead of the
+    asymmetric ``value_scale``/``neg_value_scale`` split. ``None`` -> the
+    asymmetric mapping (historical behaviour)."""
+    norm_std: Optional[float] = None
+    """Running reward std for the recentered mapping (see ``norm_mean``)."""
+    norm_k: Optional[float] = None
+    """Std-per-unit for the recentered mapping: a reward ``norm_k`` std above the
+    mean maps to ``+1`` before the clip. ``None`` -> ``2.0`` when normalizing."""
     dead_names: List[str] = field(default_factory=list)
     """Rule names killed during this episode because their ``<END>`` scored
     ``-inf`` (the rule never fires, so its whole subtree is dead). ``train``
@@ -114,10 +126,19 @@ class Trajectory:
         *,
         value_scale: Optional[float] = None,
         neg_value_scale: Optional[float] = None,
+        norm_mean: Optional[float] = None,
+        norm_std: Optional[float] = None,
+        norm_k: Optional[float] = None,
     ) -> List[float]:
-        """Per-step value target in ``[-1, +1]``. With a single scale this is
-        ``z = clip(state_value / scale, -1, +1)``; with a separate
-        ``neg_value_scale`` the mapping is asymmetric:
+        """Per-step value target in ``[-1, +1]``.
+
+        Read-time normalization (``norm_mean`` and ``norm_std`` set, from the
+        args or the stamped fields) uses one recentered scale:
+
+            z = clip((raw - norm_mean) / (norm_k * norm_std), -1, +1)
+
+        the exact inverse of ``NeuralEvaluator.denormalize``. Otherwise the
+        asymmetric split applies:
 
             z = min(+1, raw / pos)   for raw >= 0
             z = max(-1, raw / neg)   for raw < 0
@@ -126,15 +147,26 @@ class Trajectory:
         ``1.0``); ``neg`` is the negative cap (arg, else stamped
         ``neg_value_scale``, else ``pos`` -> symmetric). A step whose
         ``state_value`` is ``None`` / non-finite falls back to its own
-        ``reward``, or ``-neg`` (which maps to ``-1``) when that too is
-        non-finite, so the value loss never sees ``None`` / ``-inf`` / NaN.
+        ``reward``, or to the clip floor ``-1`` when that too is non-finite, so
+        the value loss never sees ``None`` / ``-inf`` / NaN.
         """
+        nm = norm_mean if norm_mean is not None else self.norm_mean
+        ns = norm_std if norm_std is not None else self.norm_std
+        nk = norm_k if norm_k is not None else self.norm_k
+        if nk is None:
+            nk = 2.0
+        use_norm = nm is not None and ns is not None
+        norm_scale = (nk * ns) if use_norm else None
+        if use_norm and (norm_scale is None or norm_scale <= 0):
+            norm_scale = 1e-6
+
         pos = value_scale if value_scale is not None else self.value_scale
         if not pos or pos <= 0:
             pos = 1.0
         neg = neg_value_scale if neg_value_scale is not None else self.neg_value_scale
         if not neg or neg <= 0:
             neg = pos
+
         targets: List[float] = []
         for s in self.steps:
             rv = s.state_value
@@ -143,11 +175,20 @@ class Trajectory:
             elif math.isfinite(s.reward):
                 raw = s.reward
             else:
-                raw = -neg
-            if raw >= 0:
-                targets.append(min(1.0, raw / pos))
+                raw = None                          # non-finite -> clip floor
+            if use_norm:
+                if raw is None:
+                    targets.append(-1.0)
+                else:
+                    z = (raw - nm) / norm_scale
+                    targets.append(max(-1.0, min(1.0, z)))
             else:
-                targets.append(max(-1.0, raw / neg))
+                if raw is None:
+                    raw = -neg
+                if raw >= 0:
+                    targets.append(min(1.0, raw / pos))
+                else:
+                    targets.append(max(-1.0, raw / neg))
         return targets
 
 

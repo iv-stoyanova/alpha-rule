@@ -135,19 +135,32 @@ class RuleSimulator(Evaluator):
             self._env = gym.make(self.env_name)
         return self._env
 
-    def evaluate(self, node):
+    def evaluate(self, node, *, seed=None):
         """
         Evaluate a rule node. Strips the trailing ``<END>`` marker from the
         node name so MCTS terminal nodes can be evaluated directly.
+
+        Args:
+            seed: optional per-call seed overriding ``self.seed`` for this
+                evaluation; re-seeds both the env and the agent builder so
+                repeated calls with distinct seeds are independent samples.
+                ``None`` (default) keeps the original behaviour.
         """
         # Resolve reward_scale on first use even if no consumer read it at setup.
         _ = self.reward_scale
 
+        effective_seed = self.seed if seed is None else seed
         rule_str = node.name.replace("<END>", "")
         env = self._get_env()
-        if self.seed is not None:
+        if effective_seed is not None:
             # Re-seed the base env so this rule scores reproducibly.
-            env.reset(seed=self.seed)
+            env.reset(seed=effective_seed)
         transformed_env = self.transformer(env, rule_str)
-        agent = self.agent_builder(transformed_env, **self.agent_builder_kwargs)
+        # Override the builder seed only when a per-call seed was given.
+        builder_kwargs = (
+            self.agent_builder_kwargs
+            if seed is None
+            else {**self.agent_builder_kwargs, "seed": seed}
+        )
+        agent = self.agent_builder(transformed_env, **builder_kwargs)
         return self.agent_eval(agent, transformed_env)

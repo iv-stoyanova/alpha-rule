@@ -182,6 +182,12 @@ class TrainingLog:
     backup: Optional[BackpropStrategy] = None
     """The exact ``BackpropStrategy`` training used. ``play()`` defaults to it
     for the same reason as ``selection``."""
+    normalizer: Optional[Any] = None
+    """The read-time ``RewardNormalizer`` training used (``None`` when
+    ``normalize=False``). ``play()`` reuses it so the rollout normalizes Q and
+    de-scales the value head as training did."""
+    norm_k: float = 2.0
+    """Std-per-unit for the normalizer (see ``RewardNormalizer``)."""
 
 
 def _failed_count(traj: Trajectory) -> int:
@@ -399,6 +405,9 @@ def train(
     dirichlet_alpha: float = 0.3,
     leaf_eval_mode: str = "nn",
     n_chosen_evals: int = 1,
+    # --- read-time reward normalization ---------------------------- #
+    normalize: bool = True,
+    norm_k: float = 2.0,
     # --- evaluation / logging / misc ------------------------------- #
     eval_simulator: Optional[Evaluator] = None,
     eval_every: int = 5,
@@ -606,6 +615,10 @@ def train(
     optimizer = torch.optim.Adam(
         model.parameters(), lr=learning_rate, weight_decay=weight_decay,
     )
+    # Read-time reward normalizer, one per train() call. Shared by selection,
+    # the value target, and the NeuralEvaluator de-scale; None disables it.
+    from alpha_rule.mcts.normalize import RewardNormalizer
+    normalizer = RewardNormalizer() if normalize else None
     # Wire the evaluator's value scale to the simulator's reward cap (an explicit
     # value_scale wins) so the network value and the simulator reward share one
     # scale in the MCTS backup.
@@ -613,11 +626,13 @@ def train(
         network_evaluator = NeuralEvaluator(
             model, grammar, max_len=max_len, value_scale=value_scale,
             neg_value_scale=neg_value_scale,
+            normalizer=normalizer, norm_k=norm_k,
         )
     else:
         network_evaluator = NeuralEvaluator.from_simulator(
             model, grammar, expensive_simulator, max_len=max_len,
             neg_value_scale=neg_value_scale,
+            normalizer=normalizer, norm_k=norm_k,
         )
     resolved_scale = network_evaluator.value_scale
     resolved_neg_scale = network_evaluator.neg_value_scale
@@ -632,8 +647,17 @@ def train(
     # are built from the scalar kwargs so every knob is visible at this call.
     sel = selection if selection is not None else PUCTSelection(
         c_puct=c_puct, fpu_reduction=fpu_reduction, q_source=q_source,
-        fpu_baseline=fpu_baseline,
+        fpu_baseline=fpu_baseline, normalizer=normalizer, norm_k=norm_k,
     )
+    # Attach the normalizer to an explicit selection that lacks one, so its Q
+    # and the de-scaled NN leaf value share a scale.
+    if (
+        selection is not None
+        and normalizer is not None
+        and getattr(sel, "normalizer", None) is None
+    ):
+        sel.normalizer = normalizer
+        sel.norm_k = norm_k
     if isinstance(backup, str):
         if backup == "max":
             bp: BackpropStrategy = MaxRewardBackup()
@@ -653,7 +677,8 @@ def train(
     _warn_risky_config(
         max_len=max_len,
         depth_limit=depth_limit,
-        explicit_value_scale=value_scale,
+        # value_scale is unused under normalization, so skip its mismatch check.
+        explicit_value_scale=(None if normalize else value_scale),
         simulator=expensive_simulator,
         backup=backup,
         selection=selection,
@@ -671,6 +696,8 @@ def train(
         neg_value_scale=resolved_neg_scale,
         selection=sel,
         backup=bp,
+        normalizer=normalizer,
+        norm_k=norm_k,
     )
     # Expose the in-training model immediately so ``play()`` can be called
     # from the eval hook (``eval_use_play=True``) while training is still
@@ -708,6 +735,11 @@ def train(
         else:
             sp_debug = min(debug, 1)
         t0 = time.perf_counter()
+        # Draw a per-step base seed only when n_chosen_evals > 1; otherwise leave
+        # rng untouched so the default path is unchanged.
+        chosen_eval_base_seed = (
+            int(rng.integers(0, 2**31 - 1)) if n_chosen_evals > 1 else None
+        )
         traj = run_self_play(
             grammar=grammar,
             simulator=expensive_simulator,
@@ -719,11 +751,14 @@ def train(
             backup=bp,
             rng=rng,
             n_chosen_evals=n_chosen_evals,
+            chosen_eval_base_seed=chosen_eval_base_seed,
             dirichlet_eps=dirichlet_eps,
             dirichlet_alpha=dirichlet_alpha,
             leaf_eval_mode=leaf_eval_mode,
             value_scale=resolved_scale,
             neg_value_scale=resolved_neg_scale,
+            normalizer=normalizer,
+            norm_k=norm_k,
             dead_rule_names=dead_rules if dead_rules else None,
             debug=sp_debug,
             debug_tag=f"it={it}",
@@ -995,15 +1030,19 @@ def play(
         simulator, "reward_scale", None
     )
     neg_scale = log.neg_value_scale     # None -> NeuralEvaluator mirrors `scale`
+    # Reuse the training normalizer (read-only) so play de-scales the value head
+    # as training did; None when training was unnormalized.
     if scale is not None:
         network_evaluator = NeuralEvaluator(
             model, grammar, max_len=log.max_len, value_scale=scale,
             neg_value_scale=neg_scale,
+            normalizer=log.normalizer, norm_k=log.norm_k,
         )
     else:
         network_evaluator = NeuralEvaluator.from_simulator(
             model, grammar, simulator, max_len=log.max_len,
             neg_value_scale=neg_scale,
+            normalizer=log.normalizer, norm_k=log.norm_k,
         )
 
     # No torch.no_grad() needed: every network call goes through
