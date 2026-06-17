@@ -70,7 +70,6 @@ def q_learning_agent_eval_mean_reward_success_steps(agent, env, n_eval_episodes=
     # Structural failure: the rule never matched the history in any episode.
     if not candidate_seen:
         return float("-inf")
-
     mean_reward = np.mean(rewards)
     success_rate = successes / n_eval_episodes
     mean_steps = np.mean(steps_list)

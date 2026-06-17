@@ -735,11 +735,6 @@ def train(
         else:
             sp_debug = min(debug, 1)
         t0 = time.perf_counter()
-        # Draw a per-step base seed only when n_chosen_evals > 1; otherwise leave
-        # rng untouched so the default path is unchanged.
-        chosen_eval_base_seed = (
-            int(rng.integers(0, 2**31 - 1)) if n_chosen_evals > 1 else None
-        )
         traj = run_self_play(
             grammar=grammar,
             simulator=expensive_simulator,
@@ -751,7 +746,6 @@ def train(
             backup=bp,
             rng=rng,
             n_chosen_evals=n_chosen_evals,
-            chosen_eval_base_seed=chosen_eval_base_seed,
             dirichlet_eps=dirichlet_eps,
             dirichlet_alpha=dirichlet_alpha,
             leaf_eval_mode=leaf_eval_mode,

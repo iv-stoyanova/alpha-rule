@@ -7,6 +7,7 @@ richer surface.
 """
 from __future__ import annotations
 
+import random
 import warnings
 from typing import Optional
 
@@ -52,6 +53,13 @@ class RuleSimulator(Evaluator):
             RNG position left by the previous call. For fully reproducible
             training also pass ``seed`` via ``agent_builder_kwargs`` (the
             Q-learning builder accepts it).
+        resample_seed: when ``True``, draw a fresh seed from a ``seed``-seeded
+            RNG on each ``evaluate`` (when no explicit ``seed`` is passed),
+            retrain the agent with it, and eval it, so every call is an
+            independent, reproducible draw from the rule's return distribution.
+            Default ``False`` (``seed=None`` resets the env to ``self.seed`` and
+            trains with ``agent_builder_kwargs`` unchanged: deterministic per
+            rule).
     """
 
     def __init__(
@@ -64,6 +72,7 @@ class RuleSimulator(Evaluator):
         reward_scale: Optional[float] = None,
         agent_builder_kwargs: Optional[dict] = None,
         seed: Optional[int] = None,
+        resample_seed: bool = False,
     ):
         self.env_name = env_name
         self.agent_builder = agent_builder
@@ -76,6 +85,10 @@ class RuleSimulator(Evaluator):
         self._reward_scale_resolved = reward_scale is not None
         self.agent_builder_kwargs = dict(agent_builder_kwargs or {})
         self.seed = seed
+        self.resample_seed = resample_seed
+        # Lazily built RNG, seeded from ``seed``, that draws a fresh per-call seed
+        # under resample_seed so each evaluate is an independent reproducible draw.
+        self._seed_rng: Optional[random.Random] = None
         # Lazily-constructed base env reused across evaluate calls.
         # gym.make is expensive (env init, RNG seed, action space wiring);
         # paying it once per RuleSimulator instance instead of once per
@@ -135,6 +148,13 @@ class RuleSimulator(Evaluator):
             self._env = gym.make(self.env_name)
         return self._env
 
+    def _next_seed(self) -> int:
+        """Draw a fresh seed from the ``seed``-seeded RNG, so each evaluate under
+        resample_seed retrains and evals on a new, reproducible instantiation."""
+        if self._seed_rng is None:
+            self._seed_rng = random.Random(self.seed)
+        return self._seed_rng.randrange(2 ** 31 - 1)
+
     def evaluate(self, node, *, seed=None):
         """
         Evaluate a rule node. Strips the trailing ``<END>`` marker from the
@@ -142,25 +162,34 @@ class RuleSimulator(Evaluator):
 
         Args:
             seed: optional per-call seed overriding ``self.seed`` for this
-                evaluation; re-seeds both the env and the agent builder so
-                repeated calls with distinct seeds are independent samples.
-                ``None`` (default) keeps the original behaviour.
+                evaluation; re-seeds the env and the agent builder so repeated
+                calls with distinct seeds are independent samples. ``None``
+                (default) resets the env to ``self.seed`` and trains with
+                ``agent_builder_kwargs`` unchanged, except under
+                ``resample_seed`` where a fresh seed is drawn from the seeded RNG
+                so each call retrains and evals on a new, reproducible draw.
         """
         # Resolve reward_scale on first use even if no consumer read it at setup.
         _ = self.reward_scale
 
-        effective_seed = self.seed if seed is None else seed
         rule_str = node.name.replace("<END>", "")
         env = self._get_env()
+
+        if self.resample_seed and seed is None:
+            # Fresh per-call seed: full retrain + eval, varied but reproducible.
+            effective_seed = self._next_seed()
+            builder_kwargs = {**self.agent_builder_kwargs, "seed": effective_seed}
+        else:
+            effective_seed = self.seed if seed is None else seed
+            # Override the builder seed only when a per-call seed was given.
+            builder_kwargs = (
+                self.agent_builder_kwargs
+                if seed is None
+                else {**self.agent_builder_kwargs, "seed": seed}
+            )
         if effective_seed is not None:
             # Re-seed the base env so this rule scores reproducibly.
             env.reset(seed=effective_seed)
         transformed_env = self.transformer(env, rule_str)
-        # Override the builder seed only when a per-call seed was given.
-        builder_kwargs = (
-            self.agent_builder_kwargs
-            if seed is None
-            else {**self.agent_builder_kwargs, "seed": seed}
-        )
         agent = self.agent_builder(transformed_env, **builder_kwargs)
         return self.agent_eval(agent, transformed_env)

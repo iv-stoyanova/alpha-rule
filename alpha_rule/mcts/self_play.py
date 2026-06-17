@@ -17,7 +17,6 @@ tree at every chosen production.
 from __future__ import annotations
 
 import math
-import warnings
 from typing import Iterable, List, Optional, Set
 
 import numpy as np
@@ -40,44 +39,21 @@ def _to_eval_result(raw) -> EvalResult:
     return EvalResult(value=float(raw))
 
 
-def _evaluate_maybe_seeded(simulator, node, seed, warn_state):
-    """Evaluate ``node``, passing a per-sample ``seed`` when given (an independent
-    draw). ``seed is None`` is the original no-kwarg call. If ``evaluate`` does not
-    accept ``seed``, fall back to the no-seed call and warn once."""
-    if seed is None:
-        return simulator.evaluate(node)
-    try:
-        return simulator.evaluate(node, seed=seed)
-    except TypeError:
-        if warn_state is not None and not warn_state.get("warned"):
-            warn_state["warned"] = True
-            warnings.warn(
-                "n_chosen_evals>1 asked for independent samples but "
-                f"{type(simulator).__name__}.evaluate does not accept a 'seed' "
-                "kwarg, so the samples are identical and averaging is a no-op.",
-                stacklevel=2,
-            )
-        return simulator.evaluate(node)
-
-
 def _multi_sample_chosen_reward(
-    simulator: Evaluator, node, n: int, *, base_seed=None, warn_state=None,
+    simulator: Evaluator, node, n: int,
 ) -> float:
     """
     Evaluate ``node`` ``n`` times and return the mean of the finite samples
     (``-inf`` if none were finite).
 
-    With ``base_seed`` set, sample ``i`` uses seed ``base_seed + i`` so the
-    samples are independent draws (a fixed-seed simulator would otherwise return
-    the same value every call). ``base_seed=None`` keeps the original no-seed call.
+    With a self-seeding simulator (``resample_seed``) the ``n`` calls are
+    independent draws; with a deterministic one they are identical, so ``n=1``
+    is the usual setting.
     """
     finite_sum = 0.0
     finite_count = 0
-    for i in range(max(1, n)):
-        per_seed = None if base_seed is None else base_seed + i
-        v = _to_eval_result(
-            _evaluate_maybe_seeded(simulator, node, per_seed, warn_state)
-        ).value
+    for _ in range(max(1, n)):
+        v = _to_eval_result(simulator.evaluate(node)).value
         if math.isfinite(v):
             finite_sum += v
             finite_count += 1
@@ -411,7 +387,6 @@ def run_self_play(
     backup: Optional[BackpropStrategy] = None,
     rng: Optional[np.random.Generator] = None,
     n_chosen_evals: int = 1,
-    chosen_eval_base_seed: Optional[int] = None,
     dirichlet_eps: float = 0.0,
     dirichlet_alpha: float = 0.3,
     forbidden_root_actions: Optional[Iterable[str]] = None,
@@ -510,8 +485,6 @@ def run_self_play(
         neg_value_scale = value_scale
     expansion = RuleExpansion(grammar)
     rng = rng or np.random.default_rng()
-    # One-time warn flag for the seed-aware multi-sampling fallback.
-    _warn_state = {"warned": False}
     forbidden: Set[str] = (
         set(forbidden_root_actions) if forbidden_root_actions else set()
     )
@@ -607,17 +580,10 @@ def run_self_play(
         action_name = _sample_action(sample_pi, rng)
         next_node = _apply_action_to_root(current, action_name)
 
-        # Mean simulator reward for the chosen state. Per-sample seeds vary only
-        # when n_chosen_evals > 1 and a base seed was given; the per-step offset
-        # keeps rules compared in the same step on one seed block.
-        step_base_seed = (
-            None
-            if (n_chosen_evals <= 1 or chosen_eval_base_seed is None)
-            else chosen_eval_base_seed + depth_step * n_chosen_evals
-        )
+        # Mean simulator reward for the chosen state (n independent draws when the
+        # simulator self-seeds via resample_seed; n=1 by default).
         chosen_reward = _multi_sample_chosen_reward(
             simulator, next_node, n_chosen_evals,
-            base_seed=step_base_seed, warn_state=_warn_state,
         )
         # Stamp the realised reward (kept raw) on the chosen node for the
         # RealizedReturn value target; this node becomes next step's ``current``.

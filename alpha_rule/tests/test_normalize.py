@@ -10,12 +10,11 @@ Covers:
       byte-identical when ``normalizer=None``,
     - ``Trajectory.value_targets`` recentered single-scale path, and that
       ``norm_*=None`` reproduces the asymmetric mapping,
-    - the seed-aware ``_multi_sample_chosen_reward`` (independent samples; the
-      ``base_seed=None`` path unchanged; warn-once when a simulator ignores the
-      seed), and ``RuleSimulator.evaluate(seed=...)`` re-seeding env + builder.
+    - ``_multi_sample_chosen_reward`` means the finite samples, and
+      ``RuleSimulator`` reseeding: the explicit ``seed=`` override and the
+      ``resample_seed`` per-call fresh-seed draw (varied but reproducible).
 """
 import math
-import warnings
 
 import pytest
 
@@ -195,46 +194,35 @@ def _traj_value_via_norm(n: RewardNormalizer, raw: float) -> float:
 # Seed-aware multi-sampling
 # --------------------------------------------------------------------------- #
 
-class _SeedSim:
-    """evaluate returns float(seed) when seeded, else a constant."""
-    def __init__(self, const=0.0):
-        self.const = const
-
-    def evaluate(self, node, *, seed=None):
-        return self.const if seed is None else float(seed)
-
-
-class _NoSeedSim:
-    """A simulator whose evaluate does not accept a seed kwarg."""
-    def __init__(self, const=0.7):
-        self.const = const
+class _SeqSim:
+    """Returns the next value from a fixed sequence on each evaluate; stands in
+    for a self-seeding simulator that varies per call."""
+    def __init__(self, seq):
+        self.seq = list(seq)
+        self.i = 0
 
     def evaluate(self, node):
-        return self.const
+        v = self.seq[self.i]
+        self.i += 1
+        return v
 
 
-def test_multi_sample_base_seed_varies_samples():
-    sim = _SeedSim()
-    # base_seed=100, n=3 -> seeds 100,101,102 -> mean 101.
-    out = _multi_sample_chosen_reward(sim, object(), 3, base_seed=100)
-    assert math.isclose(out, 101.0, rel_tol=1e-9)
+def test_multi_sample_means_finite_samples():
+    out = _multi_sample_chosen_reward(_SeqSim([1.0, 2.0, 3.0]), object(), 3)
+    assert math.isclose(out, 2.0, rel_tol=1e-9)
 
 
-def test_multi_sample_base_seed_none_is_unseeded():
-    sim = _SeedSim(const=0.42)
-    out = _multi_sample_chosen_reward(sim, object(), 3, base_seed=None)
-    assert math.isclose(out, 0.42, rel_tol=1e-9)
+def test_multi_sample_n1_returns_single():
+    out = _multi_sample_chosen_reward(_SeqSim([5.0]), object(), 1)
+    assert math.isclose(out, 5.0, rel_tol=1e-9)
 
 
-def test_multi_sample_warns_once_when_seed_ignored():
-    sim = _NoSeedSim(const=0.7)
-    warn_state = {"warned": False}
-    with warnings.catch_warnings(record=True) as w:
-        warnings.simplefilter("always")
-        out = _multi_sample_chosen_reward(
-            sim, object(), 3, base_seed=5, warn_state=warn_state)
-    assert math.isclose(out, 0.7, rel_tol=1e-9)        # graceful fallback
-    assert sum("seed" in str(x.message) for x in w) == 1
+def test_multi_sample_drops_non_finite():
+    out = _multi_sample_chosen_reward(
+        _SeqSim([float("-inf"), 2.0, 4.0]), object(), 3)
+    assert math.isclose(out, 3.0, rel_tol=1e-9)         # mean of the finite two
+    dead = _multi_sample_chosen_reward(_SeqSim([float("-inf")]), object(), 1)
+    assert dead == float("-inf")
 
 
 # --------------------------------------------------------------------------- #
@@ -276,3 +264,56 @@ def test_rule_simulator_seed_overrides_env_and_builder():
     sim.evaluate(_N())                      # no per-call seed -> instance seed
     assert sim._env.seeds[-1] == 123
     assert builder_seeds[-1] == 123
+
+
+# --------------------------------------------------------------------------- #
+# resample_seed: fresh seed per evaluate (full retrain), varied but reproducible
+# --------------------------------------------------------------------------- #
+
+class _RuleNode:
+    name = "A <END>"
+
+
+def _resample_sim(resample_seed):
+    pytest.importorskip("gymnasium")
+    from alpha_rule.evaluation.rule_simulator import RuleSimulator
+
+    calls = {"build": 0}
+
+    def builder(env, **kwargs):
+        calls["build"] += 1
+        return ("agent", kwargs.get("seed"))
+
+    # agent_eval reports the seed the agent trained with.
+    def agent_eval(agent, env):
+        return float(agent[1])
+
+    sim = RuleSimulator(
+        "dummy-env", builder, lambda e, r: e, agent_eval,
+        reward_scale=1.0, seed=0, agent_builder_kwargs={"seed": 0},
+        resample_seed=resample_seed,
+    )
+    sim._env = _RecordEnv()
+    return sim, calls
+
+
+def test_resample_seed_varies_and_retrains():
+    sim, calls = _resample_sim(resample_seed=True)
+    out = [sim.evaluate(_RuleNode()) for _ in range(3)]
+    assert calls["build"] == 3                  # full retrain each call (no cache)
+    assert len(set(out)) == 3                   # fresh seed each call
+
+
+def test_resample_seed_reproducible():
+    a_sim, _ = _resample_sim(resample_seed=True)
+    b_sim, _ = _resample_sim(resample_seed=True)
+    a = [a_sim.evaluate(_RuleNode()) for _ in range(3)]
+    b = [b_sim.evaluate(_RuleNode()) for _ in range(3)]
+    assert a == b                               # seeded RNG -> reproducible
+
+
+def test_resample_seed_off_is_deterministic():
+    sim, calls = _resample_sim(resample_seed=False)
+    out = [sim.evaluate(_RuleNode()) for _ in range(3)]
+    assert calls["build"] == 3                  # retrains each call (no caching)
+    assert out == [0.0, 0.0, 0.0]               # seed=None -> builder seed 0
