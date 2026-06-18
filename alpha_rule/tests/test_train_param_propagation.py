@@ -443,3 +443,17 @@ def test_leaf_eval_warmup_zero_is_all_nn(monkeypatch):
     seen = _capture_leaf_modes(
         monkeypatch, n_iterations=3, leaf_eval_warmup=0, leaf_eval_mode="nn")
     assert seen == ["nn", "nn", "nn"]
+
+
+# --------------------------------------------------------------------------- #
+# norm_robust and end_prior_scale propagate into the normalizer and the log
+# --------------------------------------------------------------------------- #
+
+def test_norm_robust_propagates_to_normalizer():
+    assert _tiny(norm_robust=True).normalizer.robust is True
+    assert _tiny(norm_robust=False).normalizer.robust is False
+
+
+def test_end_prior_scale_propagates_to_log():
+    log = _tiny(end_prior_scale=0.3)
+    assert log.end_prior_scale == 0.3

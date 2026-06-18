@@ -188,6 +188,9 @@ class TrainingLog:
     de-scales the value head as training did."""
     norm_k: float = 2.0
     """Std-per-unit for the normalizer (see ``RewardNormalizer``)."""
+    end_prior_scale: float = 1.0
+    """Multiplier on the terminal (<END>) prior used at training time. ``play()``
+    reuses it so its ``NeuralEvaluator`` down-weights <END> the same way."""
 
 
 def _failed_count(traj: Trajectory) -> int:
@@ -409,6 +412,8 @@ def train(
     # --- read-time reward normalization ---------------------------- #
     normalize: bool = True,
     norm_k: float = 2.0,
+    norm_robust: bool = True,
+    end_prior_scale: float = 1.0,
     # --- evaluation / logging / misc ------------------------------- #
     eval_simulator: Optional[Evaluator] = None,
     eval_every: int = 5,
@@ -625,7 +630,7 @@ def train(
     # Read-time reward normalizer, one per train() call. Shared by selection,
     # the value target, and the NeuralEvaluator de-scale; None disables it.
     from alpha_rule.mcts.normalize import RewardNormalizer
-    normalizer = RewardNormalizer() if normalize else None
+    normalizer = RewardNormalizer(robust=norm_robust) if normalize else None
     # Wire the evaluator's value scale to the simulator's reward cap (an explicit
     # value_scale wins) so the network value and the simulator reward share one
     # scale in the MCTS backup.
@@ -634,12 +639,14 @@ def train(
             model, grammar, max_len=max_len, value_scale=value_scale,
             neg_value_scale=neg_value_scale,
             normalizer=normalizer, norm_k=norm_k,
+            end_prior_scale=end_prior_scale,
         )
     else:
         network_evaluator = NeuralEvaluator.from_simulator(
             model, grammar, expensive_simulator, max_len=max_len,
             neg_value_scale=neg_value_scale,
             normalizer=normalizer, norm_k=norm_k,
+            end_prior_scale=end_prior_scale,
         )
     resolved_scale = network_evaluator.value_scale
     resolved_neg_scale = network_evaluator.neg_value_scale
@@ -705,6 +712,7 @@ def train(
         backup=bp,
         normalizer=normalizer,
         norm_k=norm_k,
+        end_prior_scale=end_prior_scale,
     )
     # Expose the in-training model immediately so ``play()`` can be called
     # from the eval hook (``eval_use_play=True``) while training is still
@@ -1046,12 +1054,14 @@ def play(
             model, grammar, max_len=log.max_len, value_scale=scale,
             neg_value_scale=neg_scale,
             normalizer=log.normalizer, norm_k=log.norm_k,
+            end_prior_scale=log.end_prior_scale,
         )
     else:
         network_evaluator = NeuralEvaluator.from_simulator(
             model, grammar, simulator, max_len=log.max_len,
             neg_value_scale=neg_scale,
             normalizer=log.normalizer, norm_k=log.norm_k,
+            end_prior_scale=log.end_prior_scale,
         )
 
     # No torch.no_grad() needed: every network call goes through

@@ -166,6 +166,54 @@ def test_from_simulator_matches_reward_scale():
     assert NeuralEvaluator.from_simulator(model, g, _PlainSim(), max_len=12).value_scale == 1.0
 
 
+# --------------------------------------------------------------------------- #
+# end_prior_scale: down-weight the terminal (<END>) prior so it stops dominating
+# the softmax. <END> is only applicable at non-root nodes.
+# --------------------------------------------------------------------------- #
+
+def _child_with_end():
+    """A non-root node (one event applied) where END_RULE is applicable."""
+    torch.manual_seed(11)
+    g = AllenIntervalGrammar(event_types=("A", "B"), relations=("<",))
+    tok = GrammarTokenizer(g)
+    model = AllenFormulaNet(tok, d_model=16, nhead=2, num_layers=1, max_len=12)
+    root = g.root()
+    child = g.apply(root, g.applicable_productions(root)[0])
+    assert "END_RULE" in {p.name for p in g.applicable_productions(child)}
+    return model, g, child
+
+
+def test_end_prior_scale_downweights_end_and_renormalizes():
+    model, g, child = _child_with_end()
+    base = NeuralEvaluator(model, g, max_len=12, end_prior_scale=1.0)
+    down = NeuralEvaluator(model, g, max_len=12, end_prior_scale=0.3)
+    rb = base.evaluate(child)
+    rd = down.evaluate(child)
+    assert rd.priors["END_RULE"] < rb.priors["END_RULE"]        # END falls
+    non_end = [k for k in rb.priors if k != "END_RULE"]
+    assert all(rd.priors[k] > rb.priors[k] for k in non_end)    # events rise
+    assert abs(sum(rd.priors.values()) - 1.0) < 1e-5            # still a distribution
+
+
+def test_end_prior_scale_one_is_noop():
+    model, g, child = _child_with_end()
+    base = NeuralEvaluator(model, g, max_len=12)                # default 1.0
+    one = NeuralEvaluator(model, g, max_len=12, end_prior_scale=1.0)
+    rb = base.evaluate(child)
+    ro = one.evaluate(child)
+    for k in rb.priors:
+        assert abs(rb.priors[k] - ro.priors[k]) < 1e-9
+
+
+def test_end_prior_scale_rejects_negative():
+    import pytest
+    g = AllenIntervalGrammar(event_types=("A", "B"), relations=("<",))
+    tok = GrammarTokenizer(g)
+    model = AllenFormulaNet(tok, d_model=16, nhead=2, num_layers=1, max_len=12)
+    with pytest.raises(ValueError):
+        NeuralEvaluator(model, g, max_len=12, end_prior_scale=-0.1)
+
+
 def test_neural_evaluator_drives_self_play_end_to_end():
     """The NN evaluator plugs into run_self_play (leaf_eval_mode='nn'); with
     from_simulator wiring the scale, the stored value targets stay in [-1, 1]."""

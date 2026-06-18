@@ -62,10 +62,15 @@ class NeuralEvaluator(Evaluator):
         neg_value_scale: Optional[float] = None,
         normalizer=None,
         norm_k: float = 2.0,
+        end_prior_scale: float = 1.0,
     ):
         if not (value_scale > 0):
             raise ValueError(
                 f"value_scale must be > 0, got {value_scale!r}"
+            )
+        if not (end_prior_scale >= 0):
+            raise ValueError(
+                f"end_prior_scale must be >= 0, got {end_prior_scale!r}"
             )
         if neg_value_scale is not None and not (neg_value_scale > 0):
             raise ValueError(
@@ -90,6 +95,9 @@ class NeuralEvaluator(Evaluator):
         # ``normalize``). None keeps the asymmetric value_scale/neg_value_scale.
         self.normalizer = normalizer
         self.norm_k = norm_k
+        # Multiplier on the terminal (<END>) production's prior before PUCT, so
+        # it does not dominate the softmax and starve deeper branches. 1.0 = off.
+        self.end_prior_scale = float(end_prior_scale)
 
     @classmethod
     def from_simulator(
@@ -102,6 +110,7 @@ class NeuralEvaluator(Evaluator):
         neg_value_scale: Optional[float] = None,
         normalizer=None,
         norm_k: float = 2.0,
+        end_prior_scale: float = 1.0,
     ) -> "NeuralEvaluator":
         """Build an evaluator whose ``value_scale`` matches the simulator's
         ``reward_scale`` (the same cap ``run_self_play`` / ``ReplayBuffer`` use),
@@ -118,6 +127,7 @@ class NeuralEvaluator(Evaluator):
             model, grammar, max_len=max_len,
             value_scale=scale, neg_value_scale=neg_value_scale,
             normalizer=normalizer, norm_k=norm_k,
+            end_prior_scale=end_prior_scale,
         )
 
     def evaluate(self, node) -> EvalResult:
@@ -141,6 +151,17 @@ class NeuralEvaluator(Evaluator):
             prod.name: float(priors_cpu[self.model.tokenizer.id_of[prod.name]])
             for prod in applicable
         }
+        # Down-weight the terminal (<END>) prior so it does not dominate the
+        # softmax and starve the deeper branches; renormalize the rest to sum
+        # to 1. ``end_prior_scale == 1.0`` leaves the priors untouched.
+        if self.end_prior_scale != 1.0:
+            for prod in applicable:
+                if prod.kind == "terminal":
+                    priors_dict[prod.name] *= self.end_prior_scale
+            total = sum(priors_dict.values())
+            if total > 0.0:
+                for name in priors_dict:
+                    priors_dict[name] /= total
         # De-scale the tanh output to reward units for the MCTS backup. With a
         # normalizer, use its denormalize (inverse of the value target); else the
         # asymmetric value_scale/neg_value_scale de-scale.

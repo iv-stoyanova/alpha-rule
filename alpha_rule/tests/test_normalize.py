@@ -28,8 +28,8 @@ from alpha_rule.mcts.self_play import _multi_sample_chosen_reward
 # RewardNormalizer math
 # --------------------------------------------------------------------------- #
 
-def _norm_with(values):
-    n = RewardNormalizer()
+def _norm_with(values, robust=False):
+    n = RewardNormalizer(robust=robust)
     for v in values:
         n.update(v)
     return n
@@ -86,6 +86,42 @@ def test_reset_clears():
     n = _norm_with([1.0, 2.0, 3.0])
     n.reset()
     assert n.count == 0 and n.std == 1.0 and n.mean == 0.0
+
+
+# --------------------------------------------------------------------------- #
+# Robust estimator (median + scaled MAD)
+# --------------------------------------------------------------------------- #
+
+def test_robust_center_is_median():
+    n = _norm_with([1.0, 2.0, 100.0], robust=True)   # median 2 (mean would be ~34)
+    assert math.isclose(n.mean, 2.0)
+
+
+def test_robust_scale_is_scaled_mad():
+    # [-1, 0, 1]: median 0, MAD = median(1, 0, 1) = 1, scale = 1.4826 * 1.
+    n = _norm_with([-1.0, 0.0, 1.0], robust=True)
+    assert math.isclose(n.std, 1.4826, rel_tol=1e-6)
+
+
+def test_robust_warmup_scale_is_one():
+    assert RewardNormalizer(robust=True).std == 1.0          # 0 samples
+    assert _norm_with([3.0], robust=True).std == 1.0         # 1 sample
+
+
+def test_robust_denormalize_is_inverse():
+    n = _norm_with([-3.0, 1.0, 2.0, 7.0], robust=True)
+    for raw in (-1.0, 0.5, 2.5):
+        z = n.normalize(raw)
+        if -1.0 < z < 1.0:                                   # skip clipped
+            assert math.isclose(n.denormalize(z), raw, rel_tol=1e-9, abs_tol=1e-9)
+
+
+def test_robust_scale_insensitive_to_outlier():
+    base = [-2.0, -1.0, 0.0, 1.0, 2.0]
+    welford = _norm_with(base + [-50.0], robust=False)
+    robust = _norm_with(base + [-50.0], robust=True)
+    # The -50 outlier inflates the Welford std far more than the robust scale.
+    assert welford.std > 3 * robust.std
 
 
 # --------------------------------------------------------------------------- #
