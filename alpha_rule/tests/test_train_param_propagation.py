@@ -410,3 +410,36 @@ def test_concurrent_loggers_get_distinct_run_files():
         assert a.csv_path != b.csv_path
     finally:
         shutil.rmtree(base_dir, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
+# leaf_eval_warmup: simulator leaves for the first K iterations, then the NN
+# --------------------------------------------------------------------------- #
+
+def _capture_leaf_modes(monkeypatch, **overrides):
+    """Run _tiny(**overrides) with run_self_play spied to record the
+    leaf_eval_mode it received on each iteration (delegating to the real one)."""
+    import sys
+    train_mod = sys.modules["alpha_rule.training.train"]
+    real = train_mod.run_self_play
+    seen = []
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs.get("leaf_eval_mode"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(train_mod, "run_self_play", spy)
+    _tiny(**overrides)
+    return seen
+
+
+def test_leaf_eval_warmup_uses_simulator_then_switches(monkeypatch):
+    seen = _capture_leaf_modes(
+        monkeypatch, n_iterations=4, leaf_eval_warmup=2, leaf_eval_mode="nn")
+    assert seen == ["simulator", "simulator", "nn", "nn"]
+
+
+def test_leaf_eval_warmup_zero_is_all_nn(monkeypatch):
+    seen = _capture_leaf_modes(
+        monkeypatch, n_iterations=3, leaf_eval_warmup=0, leaf_eval_mode="nn")
+    assert seen == ["nn", "nn", "nn"]

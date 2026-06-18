@@ -404,6 +404,7 @@ def train(
     dirichlet_eps: float = 0.25,
     dirichlet_alpha: float = 0.3,
     leaf_eval_mode: str = "nn",
+    leaf_eval_warmup: int = 0,
     n_chosen_evals: int = 1,
     # --- read-time reward normalization ---------------------------- #
     normalize: bool = True,
@@ -513,6 +514,12 @@ def train(
             the simulator at every leaf. The chosen-step reward written
             to the trajectory is always from the simulator regardless of
             this flag.
+        leaf_eval_warmup: number of initial iterations that score every
+            leaf with the simulator before switching to ``leaf_eval_mode``.
+            Default ``0`` (off). Withholds the untrained value head, which
+            early on predicts over-negative on promising nodes and steers
+            the search away from them. Set ``>= buffer_warmup`` so the net
+            has trained on the warmup trajectories before the switch.
         grad_clip: if > 0, clip the global gradient L2-norm during
             every ``train_step`` before ``optimizer.step()``. Default
             ``0.0`` disables clipping (the default). A value
@@ -724,6 +731,12 @@ def train(
             frac = it / (n_iterations - 1)
             temp_it = temperature + (temperature_final - temperature) * frac
 
+        # Score every leaf with the simulator during the warmup window, then
+        # switch to the configured leaf_eval_mode once the net has trained.
+        leaf_eval_mode_it = (
+            "simulator" if it < leaf_eval_warmup else leaf_eval_mode
+        )
+
         # --- MCTS / self-play -------------------------------------- #
         # Resolve this iteration's self-play debug level: paths + chosen-node
         # lines (level 1) print every iteration when debug is on; the verbose
@@ -748,7 +761,7 @@ def train(
             n_chosen_evals=n_chosen_evals,
             dirichlet_eps=dirichlet_eps,
             dirichlet_alpha=dirichlet_alpha,
-            leaf_eval_mode=leaf_eval_mode,
+            leaf_eval_mode=leaf_eval_mode_it,
             value_scale=resolved_scale,
             neg_value_scale=resolved_neg_scale,
             normalizer=normalizer,
@@ -845,6 +858,7 @@ def train(
                         selection=sel,
                         backup=bp,
                         n_chosen_evals=n_chosen_evals,
+                        leaf_eval_mode=leaf_eval_mode_it,
                         dead_rule_names=dead_rules if dead_rules else None,
                     )
                     rule_to_eval = play_rule
@@ -936,6 +950,7 @@ def play(
     n_chosen_evals: int = 1,
     selection: Optional[SelectionStrategy] = None,
     backup: Optional[BackpropStrategy] = None,
+    leaf_eval_mode: str = "nn",
 ) -> Tuple[Optional[str], float]:
     """
     AlphaZero-style greedy rollout using the trained policy/value network.
@@ -1052,6 +1067,7 @@ def play(
         backup=bp,
         rng=rng,
         n_chosen_evals=n_chosen_evals,
+        leaf_eval_mode=leaf_eval_mode,
         forbidden_root_actions=forbidden_root_actions,
         dead_rule_names=set(dead_rule_names) if dead_rule_names else None,
     )
