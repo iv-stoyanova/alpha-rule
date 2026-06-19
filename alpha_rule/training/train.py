@@ -403,6 +403,7 @@ def train(
     backup: str | BackpropStrategy = "max",
     percentile: float = 20.0,
     min_samples: int = 10,
+    value_target=None,
     # --- exploration / leaf evaluation ----------------------------- #
     dirichlet_eps: float = 0.25,
     dirichlet_alpha: float = 0.3,
@@ -583,6 +584,13 @@ def train(
             exploration of fresh actions.
         percentile, min_samples: ``PercentileRewardBackup`` knobs, used
             only when ``backup="percentile"``.
+        value_target: which quantity the value head regresses, as a name
+            (``"max"`` = ``Q_max``, best rule reachable from a state;
+            ``"expected"``, ``"mean_percentile"``, ``"realized"``), a
+            ``ValueTarget`` instance, or ``None``/``"auto"`` (default: the one
+            matching ``backup`` -- Max->MaxValue, Percentile->ExpectedValue).
+            Use ``"max"`` so a state's target reflects the best completion
+            found beneath it rather than the mean of all rollouts through it.
 
     Returns:
         ``TrainingLog`` with per-iteration metrics and the best
@@ -685,6 +693,32 @@ def train(
     else:
         bp = backup
 
+    # Resolve the value-target selector: a name ("max"/"expected"/
+    # "mean_percentile"/"realized"), a ValueTarget instance, or None/"auto"
+    # (= the target matching the backup, picked by default_value_target in
+    # run_self_play). "max" trains the value head on Q_max (best rule reachable
+    # from a state) instead of the backup's default mean.
+    if value_target is None or isinstance(value_target, str):
+        from alpha_rule.mcts.value_target import (
+            ExpectedValue, MaxValue, MeanPercentileValue, RealizedReturn,
+        )
+        _vt_map = {
+            "max": MaxValue, "expected": ExpectedValue,
+            "mean_percentile": MeanPercentileValue, "mean": MeanPercentileValue,
+            "realized": RealizedReturn,
+        }
+        if value_target is None or value_target == "auto":
+            resolved_value_target = None
+        elif value_target in _vt_map:
+            resolved_value_target = _vt_map[value_target]()
+        else:
+            raise ValueError(
+                f"unknown value_target: {value_target!r}; expected one of "
+                f"{sorted(_vt_map)}, 'auto', or a ValueTarget instance"
+            )
+    else:
+        resolved_value_target = value_target
+
     # --- Risky / inconsistent configuration warnings ----------------- #
     # Non-fatal: surface combinations that silently misbehave so a long run
     # doesn't crash mid-search or train against a mis-scaled signal.
@@ -770,6 +804,7 @@ def train(
             dirichlet_eps=dirichlet_eps,
             dirichlet_alpha=dirichlet_alpha,
             leaf_eval_mode=leaf_eval_mode_it,
+            value_target=resolved_value_target,
             value_scale=resolved_scale,
             neg_value_scale=resolved_neg_scale,
             normalizer=normalizer,

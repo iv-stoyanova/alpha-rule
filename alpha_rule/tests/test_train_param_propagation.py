@@ -457,3 +457,39 @@ def test_norm_robust_propagates_to_normalizer():
 def test_end_prior_scale_propagates_to_log():
     log = _tiny(end_prior_scale=0.3)
     assert log.end_prior_scale == 0.3
+
+
+# --------------------------------------------------------------------------- #
+# value_target selector reaches run_self_play
+# --------------------------------------------------------------------------- #
+
+def _capture_value_targets(monkeypatch, **overrides):
+    import sys
+    train_mod = sys.modules["alpha_rule.training.train"]
+    real = train_mod.run_self_play
+    seen = []
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs.get("value_target"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(train_mod, "run_self_play", spy)
+    _tiny(**overrides)
+    return seen
+
+
+def test_value_target_max_propagates(monkeypatch):
+    from alpha_rule.mcts.value_target import MaxValue
+    seen = _capture_value_targets(monkeypatch, value_target="max")
+    assert seen and all(isinstance(v, MaxValue) for v in seen)
+
+
+def test_value_target_auto_passes_none(monkeypatch):
+    seen = _capture_value_targets(monkeypatch)              # default = auto
+    assert seen and all(v is None for v in seen)
+
+
+def test_value_target_invalid_raises():
+    import pytest
+    with pytest.raises(ValueError):
+        _tiny(value_target="bogus")
