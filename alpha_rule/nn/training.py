@@ -196,6 +196,52 @@ def train_step(
     )
 
 
+def train_value_step(
+    model: AllenFormulaNet,
+    optimizer: torch.optim.Optimizer,
+    batch: List[Tuple],
+    *,
+    max_len: int,
+    grad_clip: float = 0.0,
+) -> float:
+    """One value-head-only gradient step on ``(state_name, z)`` rows (e.g. from a
+    ``ValueBuffer``). Computes only the value MSE, so only the encoder and value
+    head receive gradients; the policy head is left untouched (its params get no
+    gradient and are skipped by the optimizer). Returns the value MSE.
+
+    Use this to train the value head on harvested ``Q_max`` targets without
+    perturbing the policy, which is still trained on the committed steps by
+    ``train_step``.
+    """
+    if not batch:
+        return 0.0
+    device = next(model.parameters()).device
+    states_ids = torch.stack(
+        [
+            model.tokenizer.encode(
+                (s.name if hasattr(s, "name") else str(s)), max_len=max_len
+            )
+            for s, _ in batch
+        ],
+        dim=0,
+    ).to(device)
+    target_z = torch.tensor(
+        [float(z) for _, z in batch], dtype=torch.float32
+    ).to(device)
+
+    model.train()
+    optimizer.zero_grad()
+    _, values = model(states_ids)
+    value_loss = F.mse_loss(values, target_z)
+    value_loss.backward()
+    if grad_clip and grad_clip > 0:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(grad_clip))
+    optimizer.step()
+    # Restore eval (see train_step): keep the net in eval off the gradient step.
+    model.eval()
+    return float(value_loss.detach().item())
+
+
 def default_optimizer(
     model: AllenFormulaNet,
     *,

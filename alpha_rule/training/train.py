@@ -42,7 +42,7 @@ from alpha_rule.mcts.backprop import (
     MaxRewardBackup,
     PercentileRewardBackup,
 )
-from alpha_rule.mcts.replay import ReplayBuffer, Trajectory
+from alpha_rule.mcts.replay import ReplayBuffer, Trajectory, ValueBuffer
 from alpha_rule.mcts.selection import PUCTSelection, SelectionStrategy
 from alpha_rule.mcts.self_play import run_self_play
 
@@ -404,6 +404,8 @@ def train(
     percentile: float = 20.0,
     min_samples: int = 10,
     value_target=None,
+    value_sample_collector=None,
+    value_train_steps: int = 0,
     # --- exploration / leaf evaluation ----------------------------- #
     dirichlet_eps: float = 0.25,
     dirichlet_alpha: float = 0.3,
@@ -591,6 +593,15 @@ def train(
             matching ``backup`` -- Max->MaxValue, Percentile->ExpectedValue).
             Use ``"max"`` so a state's target reflects the best completion
             found beneath it rather than the mean of all rollouts through it.
+        value_sample_collector: optional ``ValueSampleCollector`` (see
+            ``mcts.value_collect``). When set, after each self-play search the
+            tree is harvested for extra ``(state, value)`` samples (e.g.
+            ``TreeQmaxCollector`` emits every explored node's ``Q_max``), which
+            train the value head only. ``None`` (default) = no harvest.
+        value_train_steps: number of value-head-only gradient steps per
+            iteration on the harvested samples (``train_value_step``). Gated only
+            on the value buffer being non-empty (independent of ``buffer_warmup``).
+            Default ``0`` = off (no value-only training even if a collector runs).
 
     Returns:
         ``TrainingLog`` with per-iteration metrics and the best
@@ -601,7 +612,7 @@ def train(
     from alpha_rule.evaluation.neural_evaluator import NeuralEvaluator
     from alpha_rule.nn.model import AllenFormulaNet
     from alpha_rule.nn.tokenizer import GrammarTokenizer
-    from alpha_rule.nn.training import train_step
+    from alpha_rule.nn.training import train_step, train_value_step
 
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
@@ -663,6 +674,9 @@ def train(
         value_scale=resolved_scale,
         neg_value_scale=resolved_neg_scale,
     )
+    # Value-head-only buffer for samples harvested from the search tree. Stays
+    # empty unless a value_sample_collector is given.
+    value_buffer = ValueBuffer(capacity=buffer_capacity)
 
     # Resolve the search strategies once. ``selection``/``backup`` accept an
     # explicit object (advanced override, takes precedence); otherwise they
@@ -805,6 +819,7 @@ def train(
             dirichlet_alpha=dirichlet_alpha,
             leaf_eval_mode=leaf_eval_mode_it,
             value_target=resolved_value_target,
+            value_sample_collector=value_sample_collector,
             value_scale=resolved_scale,
             neg_value_scale=resolved_neg_scale,
             normalizer=normalizer,
@@ -833,6 +848,8 @@ def train(
         # --- Replay buffer push ------------------------------------ #
         t0 = time.perf_counter()
         buffer.push_trajectory(traj)
+        if traj.value_samples:
+            value_buffer.push(traj.value_sample_targets())
         t_buffer_s = time.perf_counter() - t0
 
         # --- NN training step ------------------------------------- #
@@ -854,6 +871,14 @@ def train(
             train_total /= max(1, train_steps_per_iteration)
             train_policy /= max(1, train_steps_per_iteration)
             train_value /= max(1, train_steps_per_iteration)
+        # Value-head-only training on harvested tree samples. Gated on the value
+        # buffer (not buffer_warmup), so it can start on the first episode.
+        if value_train_steps > 0 and len(value_buffer) > 0:
+            for _ in range(value_train_steps):
+                train_value_step(
+                    model, optimizer, value_buffer.sample(batch_size),
+                    max_len=max_len, grad_clip=grad_clip,
+                )
         t_nn_train_s = time.perf_counter() - t0
 
         # --- Running best (updated BEFORE the eval so eval sees it) - #

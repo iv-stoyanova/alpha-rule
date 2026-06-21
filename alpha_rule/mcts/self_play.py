@@ -392,6 +392,7 @@ def run_self_play(
     forbidden_root_actions: Optional[Iterable[str]] = None,
     leaf_eval_mode: str = "nn",
     value_target: Optional[ValueTarget] = None,
+    value_sample_collector=None,
     value_scale: Optional[float] = None,
     neg_value_scale: Optional[float] = None,
     normalizer=None,
@@ -518,6 +519,10 @@ def run_self_play(
     # Rule names killed mid-episode (a <END> scored -inf). Stamped on the
     # returned Trajectory so train() folds them into its persistent dead set.
     newly_dead: Set[str] = set()
+    # Value samples harvested from each per-step search tree (name -> max raw
+    # target), deduped across steps keeping the best estimate. Empty unless a
+    # value_sample_collector was given.
+    harvested: dict = {}
 
     for depth_step in range(depth_limit):
         # Dirichlet noise on the root's child priors, once per step (skipped
@@ -557,6 +562,13 @@ def run_self_play(
             debug=debug,
             debug_tag=debug_tag,
         )
+        # Harvest extra value-head samples from the tree just built (e.g. each
+        # explored node's Q_max), keeping the max per name across steps.
+        if value_sample_collector is not None:
+            for name, raw in value_sample_collector.collect(current):
+                prev = harvested.get(name)
+                if prev is None or raw > prev:
+                    harvested[name] = raw
         # Fold rules killed this round into the live dead set so later steps of
         # this same episode skip them on expansion too.
         if newly_dead:
@@ -639,4 +651,5 @@ def run_self_play(
         norm_std=(normalizer.std if normalizer is not None else None),
         norm_k=(norm_k if normalizer is not None else None),
         dead_names=sorted(newly_dead),
+        value_samples=list(harvested.items()),
     )

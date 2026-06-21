@@ -120,6 +120,12 @@ class Trajectory:
     folds these into its persistent dead set so future iterations prune them
     without re-spending a simulator call. Empty for episodes that killed
     nothing."""
+    value_samples: List[Tuple[str, float]] = field(default_factory=list)
+    """Extra ``(state_name, raw_value_target)`` pairs harvested from the search
+    tree (e.g. each explored node's ``Q_max``) for value-head-only training,
+    beyond the committed ``steps``. Empty unless a ``value_sample_collector`` ran
+    in ``run_self_play``. Normalized into ``[-1, +1]`` by ``value_sample_targets``
+    with the same mapping ``value_targets`` uses."""
 
     def value_targets(
         self,
@@ -191,6 +197,33 @@ class Trajectory:
                     targets.append(max(-1.0, raw / neg))
         return targets
 
+    def value_sample_targets(self) -> List[Tuple[str, float]]:
+        """Normalize the harvested ``value_samples`` raw targets into
+        ``[-1, +1]`` with the SAME mapping ``value_targets`` uses (the stamped
+        ``norm_*`` recentered scale, else the asymmetric ``value_scale`` split),
+        returning ``(name, z)`` pairs. Non-finite raw maps to the clip floor."""
+        nm, ns = self.norm_mean, self.norm_std
+        nk = self.norm_k if self.norm_k is not None else 2.0
+        use_norm = nm is not None and ns is not None
+        norm_scale = (nk * ns) if use_norm else None
+        if use_norm and (norm_scale is None or norm_scale <= 0):
+            norm_scale = 1e-6
+        pos = self.value_scale if (self.value_scale and self.value_scale > 0) else 1.0
+        neg = self.neg_value_scale if (self.neg_value_scale and self.neg_value_scale > 0) else pos
+
+        out: List[Tuple[str, float]] = []
+        for name, raw in self.value_samples:
+            if raw is None or not math.isfinite(raw):
+                z = -1.0
+            elif use_norm:
+                z = max(-1.0, min(1.0, (raw - nm) / norm_scale))
+            elif raw >= 0:
+                z = min(1.0, raw / pos)
+            else:
+                z = max(-1.0, raw / neg)
+            out.append((name, z))
+        return out
+
 
 class ReplayBuffer:
     """
@@ -256,6 +289,38 @@ class ReplayBuffer:
 
     def sample(self, batch_size: int) -> List[Tuple]:
         """Uniform random sample (without replacement) of up to ``batch_size`` rows."""
+        n = min(batch_size, len(self._buf))
+        if n == 0:
+            return []
+        return random.sample(self._buf, k=n)
+
+    def __len__(self) -> int:
+        return len(self._buf)
+
+
+class ValueBuffer:
+    """Bounded FIFO buffer of ``(state_name, value_target_z)`` rows for
+    value-head-only training. Targets are already normalized into ``[-1, +1]``
+    (push the output of ``Trajectory.value_sample_targets``)."""
+
+    def __init__(self, capacity: int = 10_000):
+        self._buf: deque = deque(maxlen=capacity)
+
+    @property
+    def capacity(self) -> Optional[int]:
+        return self._buf.maxlen
+
+    @property
+    def fill_fraction(self) -> float:
+        cap = self._buf.maxlen
+        return (len(self._buf) / cap) if cap else 0.0
+
+    def push(self, samples) -> None:
+        """Append ``(name, z)`` pairs (e.g. from ``value_sample_targets``)."""
+        for name, z in samples:
+            self._buf.append((name, float(z)))
+
+    def sample(self, batch_size: int) -> List[Tuple]:
         n = min(batch_size, len(self._buf))
         if n == 0:
             return []
