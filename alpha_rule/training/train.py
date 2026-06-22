@@ -1014,6 +1014,13 @@ def train(
                     f"r={it_log.eval_reward:.2f} succ={stxt}"
                 )
             print(line)
+            # At debug>=2, list exactly which nodes were harvested this
+            # iteration (name=raw Q_max), best-reachable first.
+            if debug >= 2 and traj.value_samples:
+                rows = sorted(traj.value_samples, key=lambda kv: kv[1], reverse=True)
+                shown = ", ".join(f"{n}={q:.2f}" for n, q in rows[:30])
+                extra = f"  (+{len(rows) - 30} more)" if len(rows) > 30 else ""
+                print(f"  [it={it}] harvested {len(rows)} nodes: {shown}{extra}")
 
         if on_iteration_end is not None:
             on_iteration_end(it_log)
