@@ -36,6 +36,7 @@ class TrainStepLog:
     total: float
     policy: float
     value: float
+    entropy: float = 0.0
 
 
 def collate(
@@ -132,10 +133,12 @@ def train_step(
     value_weight: float = 1.0,
     policy_weight: float = 1.0,
     grad_clip: float = 0.0,
+    entropy_beta: float = 0.0,
+    label_smoothing: float = 0.0,
 ) -> TrainStepLog:
     """
-    Single training step. Returns a ``TrainStepLog`` with the three
-    scalar losses.
+    Single training step. Returns a ``TrainStepLog`` with the scalar losses
+    (and the mean policy entropy when an entropy bonus is requested).
 
     Args:
         grad_clip: if > 0, clip the global gradient L2-norm to this value
@@ -143,6 +146,16 @@ def train_step(
             A modest positive value (e.g. ``1.0``) helps runs that ingest
             unnormalised large-magnitude value targets, where Adam's
             second-moment estimate can otherwise be destabilised.
+        entropy_beta: if > 0, subtract ``entropy_beta * H(policy)`` from the
+            loss, rewarding a flatter predicted policy. Counters an
+            over-confident prior collapsing onto its argmax child early in
+            training. ``0.0`` (default) is the plain AlphaZero loss.
+        label_smoothing: if > 0, mix the policy TARGET with the uniform
+            distribution over the legal (masked) actions:
+            ``(1 - eps) * pi + eps * uniform``. Flattens the target itself, so
+            the policy is never trained to be fully confident. Rows with no
+            visit mass are left untouched. ``0.0`` (default) keeps the raw
+            visit target.
     """
     if not batch:
         return TrainStepLog(0.0, 0.0, 0.0)
@@ -160,6 +173,18 @@ def train_step(
     target_z = target_z.to(device)
     if applicable_mask is not None:
         applicable_mask = applicable_mask.to(device)
+
+    if label_smoothing and label_smoothing > 0:
+        # Flatten the target toward uniform over the legal actions; leave
+        # all-zero (no-visit) rows untouched so they keep their zero mass.
+        if applicable_mask is not None:
+            denom = applicable_mask.sum(dim=-1, keepdim=True).clamp(min=1)
+            uniform = applicable_mask.to(target_pi.dtype) / denom
+        else:
+            uniform = torch.full_like(target_pi, 1.0 / target_pi.shape[-1])
+        smoothed = (1.0 - label_smoothing) * target_pi + label_smoothing * uniform
+        has_mass = target_pi.sum(dim=-1, keepdim=True) > 0
+        target_pi = torch.where(has_mass, smoothed, target_pi)
 
     model.train()
     optimizer.zero_grad()
@@ -181,6 +206,21 @@ def train_step(
     policy_loss = -(target_pi * log_probs).sum(dim=-1).mean()
     value_loss = F.mse_loss(values, target_z)
     total = policy_weight * policy_loss + value_weight * value_loss
+
+    entropy_val = 0.0
+    if entropy_beta and entropy_beta > 0:
+        # Reward a flatter predicted policy: subtract beta * H(policy). Outside
+        # the mask both probs and log_probs are zero, so the sum is over legal
+        # actions only.
+        if applicable_mask is not None:
+            probs = torch.where(applicable_mask, log_probs.exp(),
+                                torch.zeros_like(log_probs))
+        else:
+            probs = log_probs.exp()
+        entropy = -(probs * log_probs).sum(dim=-1).mean()
+        entropy_val = float(entropy.detach().item())
+        total = total - entropy_beta * entropy
+
     total.backward()
     if grad_clip and grad_clip > 0:
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(grad_clip))
@@ -193,6 +233,7 @@ def train_step(
         total=float(total.detach().item()),
         policy=float(policy_loss.detach().item()),
         value=float(value_loss.detach().item()),
+        entropy=entropy_val,
     )
 
 

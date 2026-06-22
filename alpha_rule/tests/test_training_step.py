@@ -225,6 +225,90 @@ def test_train_step_4tuple_batch_runs_and_reduces_loss():
     assert log_third.total < log_first.total
 
 
+# --------------------------------------------------------------------------- #
+# entropy_beta — opt-in policy-entropy bonus (rewards a flatter prior).
+# label_smoothing — opt-in flattening of the visit-count target.
+# Both default 0.0 (off) and must be byte-identical to the legacy path then.
+# --------------------------------------------------------------------------- #
+
+def test_entropy_bonus_default_off_matches_baseline():
+    """``entropy_beta=0.0`` (default) produces the same parameters as omitting it."""
+    import copy
+    model_a, optim_a, tok = _setup()
+    model_b = copy.deepcopy(model_a)
+    optim_b = torch.optim.Adam(model_b.parameters(), lr=1e-2)
+
+    batch = _fixed_batch(tok)
+    train_step(model_a, optim_a, batch, max_len=12)                  # no kwarg
+    train_step(model_b, optim_b, batch, max_len=12, entropy_beta=0.0)  # explicit 0
+
+    for p_a, p_b in zip(model_a.parameters(), model_b.parameters()):
+        assert torch.allclose(p_a, p_b, atol=1e-7)
+
+
+def test_entropy_bonus_active_reports_entropy_and_changes_update():
+    """With ``entropy_beta>0`` the step reports a positive policy entropy and the
+    resulting parameters differ from the no-bonus update."""
+    import copy
+    model_a, optim_a, tok = _setup()
+    model_b = copy.deepcopy(model_a)
+    optim_b = torch.optim.Adam(model_b.parameters(), lr=1e-2)
+
+    batch = _fixed_batch(tok)
+    log_a = train_step(model_a, optim_a, batch, max_len=12)                    # baseline
+    log_b = train_step(model_b, optim_b, batch, max_len=12, entropy_beta=0.1)  # bonus
+
+    assert log_a.entropy == 0.0                       # not computed when off
+    assert log_b.entropy > 0.0 and log_b.entropy == log_b.entropy    # finite, positive
+    diverged = any(not torch.allclose(pa, pb, atol=1e-7)
+                   for pa, pb in zip(model_a.parameters(), model_b.parameters()))
+    assert diverged, "entropy bonus must change the gradient update"
+
+
+def test_entropy_bonus_finite_under_masking():
+    """Masked (4-tuple) batches must not produce NaN entropy (the 0*-inf trap)."""
+    model, optim, tok = _setup()
+    batch = [
+        ("A",     {"A": 1.0},        0.5, ("A", "B")),
+        ("A B <", {"<": 1.0},        1.0, ("END_RULE", "<")),
+    ]
+    log = train_step(model, optim, batch, max_len=12, entropy_beta=0.05)
+    assert log.entropy == log.entropy and log.entropy >= 0.0     # not NaN
+
+
+def test_label_smoothing_default_off_matches_baseline():
+    """``label_smoothing=0.0`` (default) matches omitting it."""
+    import copy
+    model_a, optim_a, tok = _setup()
+    model_b = copy.deepcopy(model_a)
+    optim_b = torch.optim.Adam(model_b.parameters(), lr=1e-2)
+
+    batch = _fixed_batch(tok)
+    train_step(model_a, optim_a, batch, max_len=12)
+    train_step(model_b, optim_b, batch, max_len=12, label_smoothing=0.0)
+
+    for p_a, p_b in zip(model_a.parameters(), model_b.parameters()):
+        assert torch.allclose(p_a, p_b, atol=1e-7)
+
+
+def test_label_smoothing_active_changes_update():
+    """A positive ``label_smoothing`` flattens the target, changing the update
+    (masked 4-tuple path), without NaN."""
+    import copy
+    model_a, optim_a, tok = _setup()
+    model_b = copy.deepcopy(model_a)
+    optim_b = torch.optim.Adam(model_b.parameters(), lr=1e-2)
+
+    batch = [("A", {"A": 1.0}, 0.5, ("A", "B"))]      # sharp target over 2 legal acts
+    train_step(model_a, optim_a, batch, max_len=12)                       # baseline
+    log_b = train_step(model_b, optim_b, batch, max_len=12, label_smoothing=0.3)
+
+    assert log_b.policy == log_b.policy               # not NaN
+    diverged = any(not torch.allclose(pa, pb, atol=1e-7)
+                   for pa, pb in zip(model_a.parameters(), model_b.parameters()))
+    assert diverged, "label smoothing must change the effective target/update"
+
+
 def test_grad_clip_reduces_norm_vs_unclipped_on_large_targets():
     """Smoke-level: on a batch with large value targets, the clipped run
     has strictly smaller grad-norm than the unclipped run."""

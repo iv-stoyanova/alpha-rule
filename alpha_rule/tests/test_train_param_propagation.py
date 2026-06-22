@@ -111,6 +111,10 @@ def test_train_defaults_match_design_choices():
     params = inspect.signature(train).parameters
     assert params["temperature_final"].default == 0.1     # decay on
     assert params["dirichlet_eps"].default == 0.25        # exploration on
+    # Prior-overfit regularisers default to the A/B-verified mild setting.
+    assert params["entropy_beta"].default == 0.03
+    assert params["label_smoothing"].default == 0.05
+    assert params["weight_decay"].default == 1e-4
 
 
 # --------------------------------------------------------------------------- #

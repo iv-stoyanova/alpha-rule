@@ -399,10 +399,12 @@ def train(
     # --- optimisation ---------------------------------------------- #
     train_steps_per_iteration: int = 4,
     learning_rate: float = 1e-3,
-    weight_decay: float = 0.0,
+    weight_decay: float = 1e-4,
     grad_clip: float = 0.0,
     value_weight: float = 1.0,
     policy_weight: float = 1.0,
+    entropy_beta: float = 0.03,
+    label_smoothing: float = 0.05,
     # --- selection (PUCT) ------------------------------------------ #
     c_puct: float = 1.5,
     fpu_reduction: float = 0.25,
@@ -571,10 +573,22 @@ def train(
             larger ``eval_every`` if that matters.
         dim_feedforward: Transformer feed-forward width (default 128).
         dropout: Transformer dropout probability (default 0.0).
-        weight_decay: Adam L2 weight-decay coefficient (default 0.0).
+        weight_decay: Adam L2 weight-decay coefficient (default 1e-4).
+            Shrinking the logits flattens the prior softmax, countering an
+            over-confident early prior; set 0.0 to leave the prior unshrunk.
         value_weight, policy_weight: relative weights of the value (MSE)
             and policy (cross-entropy) loss terms in ``train_step``
             (default 1.0 each).
+        entropy_beta: reward policy entropy (subtract ``entropy_beta * H``
+            from the loss) so the learned prior stays flatter and does not
+            collapse onto its argmax child early. Default 0.03; A/B showed
+            this loosens the prior-vs-Q visit dominance (7.7x to 5.3x) with
+            no downside, while pushing it to 0.15 saturates. Set 0.0 to off.
+        label_smoothing: mix the visit-count policy target with the uniform
+            over legal actions before the cross-entropy, capping how confident
+            the target can be (default 0.05; 0.0 = off). The prior
+            regularisers nudge but do not flip the visit-count commit; a
+            completed-Q commit/target is the structural fix above this ceiling.
         c_puct, fpu_reduction, q_source: ``PUCTSelection`` knobs used to
             build the default selection strategy (see ``selection``).
             ``q_source`` is ``"max"`` (read ``Q_max``) or
@@ -888,6 +902,8 @@ def train(
                     value_weight=value_weight,
                     policy_weight=policy_weight,
                     grad_clip=grad_clip,
+                    entropy_beta=entropy_beta,
+                    label_smoothing=label_smoothing,
                 )
                 train_total += step_log.total
                 train_policy += step_log.policy
