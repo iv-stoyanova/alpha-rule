@@ -238,3 +238,25 @@ def test_train_no_value_steps_without_collector(monkeypatch):
     monkeypatch.setattr(nn_training, "train_value_step", spy)
     _tiny_train()                                  # no collector, value_train_steps=0
     assert calls["n"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# Visibility: harvest metrics on the iteration log + CSV columns
+# --------------------------------------------------------------------------- #
+
+def test_iteration_log_records_harvest_metrics():
+    log = _tiny_train(value_sample_collector=TreeQmaxCollector(min_visits=1),
+                      value_train_steps=2)
+    assert any(it.n_value_samples > 0 for it in log.iterations)        # harvested
+    assert all(it.value_harvest_loss >= 0.0 for it in log.iterations)  # recorded
+
+
+def test_iteration_log_no_harvest_without_collector():
+    log = _tiny_train()
+    assert all(it.n_value_samples == 0 for it in log.iterations)
+
+
+def test_csv_columns_include_harvest_metrics():
+    from alpha_rule.training.csv_logger import CSV_COLUMNS
+    assert "n_value_samples" in CSV_COLUMNS
+    assert "value_harvest_loss" in CSV_COLUMNS

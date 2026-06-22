@@ -93,6 +93,15 @@ class IterationLog:
     1.0 means the buffer is evicting old targets each iteration; very low
     means the capacity dwarfs your throughput."""
 
+    n_value_samples: int = 0
+    """Value-head samples harvested from the search tree this iteration
+    (``len(Trajectory.value_samples)``; 0 when no ``value_sample_collector``
+    ran)."""
+
+    value_harvest_loss: float = 0.0
+    """Mean value-only MSE across this iteration's ``train_value_step`` calls on
+    the harvested samples (0.0 when no value-only training ran)."""
+
     best_formula_in_trajectory: Optional[str] = None
     """Name of the rule that earned ``best_reward_in_trajectory`` this
     iteration. ``None`` when the trajectory had no finite-reward steps
@@ -873,12 +882,16 @@ def train(
             train_value /= max(1, train_steps_per_iteration)
         # Value-head-only training on harvested tree samples. Gated on the value
         # buffer (not buffer_warmup), so it can start on the first episode.
+        n_value_samples = len(traj.value_samples)
+        value_harvest_loss = 0.0
         if value_train_steps > 0 and len(value_buffer) > 0:
+            _v_sum = 0.0
             for _ in range(value_train_steps):
-                train_value_step(
+                _v_sum += train_value_step(
                     model, optimizer, value_buffer.sample(batch_size),
                     max_len=max_len, grad_clip=grad_clip,
                 )
+            value_harvest_loss = _v_sum / max(1, value_train_steps)
         t_nn_train_s = time.perf_counter() - t0
 
         # --- Running best (updated BEFORE the eval so eval sees it) - #
@@ -956,6 +969,8 @@ def train(
             train_value=train_value,
             n_dead_rules=len(dead_rules),
             buffer_fill_fraction=buffer.fill_fraction,
+            n_value_samples=n_value_samples,
+            value_harvest_loss=value_harvest_loss,
             best_formula_in_trajectory=best_state_str,
             eval_reward=eval_reward,
             eval_success_rate=eval_success,
@@ -984,6 +999,11 @@ def train(
                 f"val={it_log.train_value:.3f} | dead={it_log.n_dead_rules} "
                 f"buf={it_log.buffer_fill_fraction:.2f}"
             )
+            if it_log.n_value_samples or it_log.value_harvest_loss:
+                line += (
+                    f" | harvest={it_log.n_value_samples} "
+                    f"v_loss={it_log.value_harvest_loss:.3f}"
+                )
             if it_log.eval_reward is not None:
                 stxt = (
                     f"{it_log.eval_success_rate:.2f}"

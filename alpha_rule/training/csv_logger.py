@@ -50,6 +50,9 @@ CSV_COLUMNS = [
     # --- search-health additions ---
     "n_dead_rules",
     "buffer_fill_fraction",
+    # --- value-sample harvesting ---
+    "n_value_samples",
+    "value_harvest_loss",
     # The rule the eval_* columns above actually describe (the play() result
     # under eval_use_play, else the running-best). Kept distinct from
     # running_best_formula so the eval numbers are never read against the
@@ -225,6 +228,8 @@ class AlphaZeroCSVLogger:
         t_buffer_s: float = 0.0,
         n_dead_rules: int = 0,
         buffer_fill_fraction: Optional[float] = None,
+        n_value_samples: int = 0,
+        value_harvest_loss: Optional[float] = None,
         eval_formula: Optional[str] = None,
     ) -> None:
         """Append one row. Updates the running-best tracker.
@@ -280,6 +285,8 @@ class AlphaZeroCSVLogger:
                     _round(t_buffer_s, 4),
                     n_dead_rules,
                     _round(buffer_fill_fraction, 4),
+                    n_value_samples,
+                    _round(value_harvest_loss, 4),
                     eval_formula or "",
                 ]
             )
@@ -305,6 +312,8 @@ class AlphaZeroCSVLogger:
                 t_buffer_s=getattr(it, "t_buffer_s", 0.0),
                 n_dead_rules=getattr(it, "n_dead_rules", 0),
                 buffer_fill_fraction=getattr(it, "buffer_fill_fraction", None),
+                n_value_samples=getattr(it, "n_value_samples", 0),
+                value_harvest_loss=getattr(it, "value_harvest_loss", None),
                 eval_formula=getattr(it, "eval_formula", None),
             )
 
@@ -354,6 +363,8 @@ class AlphaZeroCSVLogger:
                 t_buffer_s=getattr(it_log, "t_buffer_s", 0.0),
                 n_dead_rules=getattr(it_log, "n_dead_rules", 0),
                 buffer_fill_fraction=getattr(it_log, "buffer_fill_fraction", None),
+                n_value_samples=getattr(it_log, "n_value_samples", 0),
+                value_harvest_loss=getattr(it_log, "value_harvest_loss", None),
                 eval_formula=getattr(it_log, "eval_formula", None),
             )
 
