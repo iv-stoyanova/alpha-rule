@@ -28,6 +28,7 @@ best-formula seen so far.
 from __future__ import annotations
 
 import math
+import os
 import time
 import warnings
 from dataclasses import dataclass, field
@@ -435,6 +436,7 @@ def train(
     seed: int = 0,
     debug: int = 0,
     debug_every: int = 1,
+    debug_trace_dir: Optional[str] = None,
 ) -> TrainingLog:
     """
     Run ``n_iterations`` self-play + train iterations.
@@ -687,6 +689,16 @@ def train(
     # empty unless a value_sample_collector is given.
     value_buffer = ValueBuffer(capacity=buffer_capacity)
 
+    # DEBUG (debug branch): Q-value tracing + per-decision capture. Off unless
+    # debug_trace_dir is set; safe to delete with the rest of the debug seam.
+    q_trace = decision_trace = None
+    if debug_trace_dir is not None:
+        from alpha_rule.mcts.debug_trace import (
+            DecisionTraceCollector, QTraceCollector,
+        )
+        q_trace = QTraceCollector()
+        decision_trace = DecisionTraceCollector()
+
     # Resolve the search strategies once. ``selection``/``backup`` accept an
     # explicit object (advanced override, takes precedence); otherwise they
     # are built from the scalar kwargs so every knob is visible at this call.
@@ -833,6 +845,9 @@ def train(
             neg_value_scale=resolved_neg_scale,
             normalizer=normalizer,
             norm_k=norm_k,
+            q_trace_collector=q_trace,
+            decision_trace_collector=decision_trace,
+            iteration=it,
             dead_rule_names=dead_rules if dead_rules else None,
             debug=sp_debug,
             debug_tag=f"it={it}",
@@ -1024,6 +1039,17 @@ def train(
 
         if on_iteration_end is not None:
             on_iteration_end(it_log)
+
+        # DEBUG: per-iteration Q-trace report (prints top-k nodes/level with
+        # source-split distributions) and rolls the iteration into the dump store.
+        if q_trace is not None:
+            q_trace.report(it)
+
+    # DEBUG: dump the Q-trace + decision traces for the H1-H6 analysis script.
+    if debug_trace_dir is not None:
+        q_trace.dump(os.path.join(debug_trace_dir, "qtrace.json"))
+        decision_trace.dump(os.path.join(debug_trace_dir, "decision_trace.json"))
+        print(f"  [debug] traces dumped to {debug_trace_dir}")
 
     # ``log.model`` is already populated at the top of train() so the
     # eval hook (and the caller) see the trained model live.

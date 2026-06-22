@@ -241,6 +241,7 @@ def _run_one_round(
     depth_limit: Optional[int] = None,
     newly_dead: Optional[Set[str]] = None,
     normalizer=None,
+    q_trace_collector=None,
     debug: int = 0,
     debug_tag: str = "",
 ) -> None:
@@ -354,6 +355,8 @@ def _run_one_round(
                   f"({'terminal' if is_terminal_leaf else 'leaf'}) "
                   f"via {mode} -> {vtxt}")
         backup.update(node, result.value)
+        if q_trace_collector is not None:
+            q_trace_collector.record_eval(node, result.value, mode)
 
         # A terminal <END> scoring -inf means the rule never fires. The grammar
         # is monotone (extensions only add constraints), so no extension can
@@ -397,6 +400,9 @@ def run_self_play(
     neg_value_scale: Optional[float] = None,
     normalizer=None,
     norm_k: float = 2.0,
+    q_trace_collector=None,
+    decision_trace_collector=None,
+    iteration: int = 0,
     dead_rule_names: Optional[Set[str]] = None,
     debug: int = 0,
     debug_tag: str = "",
@@ -559,6 +565,7 @@ def run_self_play(
             depth_limit=depth_limit,
             newly_dead=newly_dead,
             normalizer=normalizer,
+            q_trace_collector=q_trace_collector,
             debug=debug,
             debug_tag=debug_tag,
         )
@@ -591,6 +598,9 @@ def run_self_play(
             sample_pi = _normalised_visit_distribution(current, temperature=temperature)
         action_name = _sample_action(sample_pi, rng)
         next_node = _apply_action_to_root(current, action_name)
+        if decision_trace_collector is not None:
+            decision_trace_collector.record_decision(
+                iteration, depth_step, current, action_name)
 
         # Mean simulator reward for the chosen state (n independent draws when the
         # simulator self-seeds via resample_seed; n=1 by default).
